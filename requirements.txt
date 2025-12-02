@@ -3,3 +3,4 @@ polars==0.16.16
 duckdb==0.8.1
 openpyxl==3.1.2
 pyarrow==11.0.0
+pip install --only-binary :all: duckdb==0.8.1 pyarrow==11.0.0
