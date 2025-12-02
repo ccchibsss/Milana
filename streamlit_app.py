@@ -328,12 +328,18 @@ class HighVolumeAutoPartsCatalog:
                 pl.col('multiplicity').cast(pl.Utf8).alias('_multiplicity_str'),
             ])
             parts_df = parts_df.with_columns(
-                pl.concat_str([
-                    'Артикул: ', pl.col('_artikul_str'),
-                    ', Бренд: ', pl.col('_brand_str'),
-                    ', Кратность: ', pl.col('_multiplicity_str'), ' шт.'
-                ], separator='').alias('description')
-            )
+                # Перед созданием строки description
+for col in ['_artikul_str', '_brand_str', '_multiplicity_str']:
+    if col not in parts_df.columns:
+        parts_df = parts_df.with_columns(pl.lit('').alias(col))
+
+parts_df = parts_df.with_columns(
+    pl.concat_str([
+        'Артикул: ', pl.col('_artikul_str'),
+        ', Бренд: ', pl.col('_brand_str'),
+        ', Кратность: ', pl.col('_multiplicity_str'), ' шт.'
+    ], separator='').alias('description')
+)
             parts_df = parts_df.drop(['_artikul_str', '_brand_str', '_multiplicity_str'])
 
             final_columns = [
