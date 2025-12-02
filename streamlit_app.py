@@ -272,7 +272,7 @@ class HighVolumeAutoPartsCatalog:
         if key_files:
             all_parts = pl.concat([
                 df.select(['artikul', 'artikul_norm', 'brand', 'brand_norm']) 
-                for df in key_files.values() if 'artikul_norm' in df.columns and 'brand_norm' in df.columns
+                for ftype, df in key_files.items() if 'artikul_norm' in df.columns and 'brand_norm' in df.columns
             ]).filter(pl.col('artikul_norm') != "").unique(subset=['artikul_norm', 'brand_norm'], keep='first')
             parts_df = all_parts
             for ftype in file_priority:
@@ -350,7 +350,7 @@ class HighVolumeAutoPartsCatalog:
         stats = {}
         st.info("🚀 Начало параллельного чтения и подготовки файлов...")
         n_files = len(file_paths)
-        file_progress_bar = st.progress(0, text="Ожидание...")
+        file_progress_bar = st.progress(0, text=f"Ожидание...")
         dataframes = {}
         processed_files = 0
         with ThreadPoolExecutor() as executor:
@@ -376,7 +376,7 @@ class HighVolumeAutoPartsCatalog:
         if not dataframes:
             st.error("❌ Ни один файл не был загружен. Обработка остановлена.")
             return {}
-        self.process_and_load_data(dataframes)
+        self.process_and_load(dataframes)
         processing_time = time.time() - start_time
         total_records = self.get_total_records()
         stats['processing_time'] = processing_time
@@ -412,99 +412,6 @@ class HighVolumeAutoPartsCatalog:
                 cr1.artikul_norm,
                 cr1.brand_norm,
                 STRING_AGG(DISTINCT regexp_replace(regexp_replace(p2.artikul, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\-\s]', '', 'g'), ', ') as analog_list
-            FROM cross_references cr1
-            JOIN cross_references cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
-            JOIN parts_data p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
-            WHERE cr1.artikul_norm != p2.artikul_norm OR cr1.brand_norm != p2.brand_norm
-            GROUP BY cr1.artikul_norm, cr1.brand_norm
-        )
-        SELECT
-            p.artikul AS "Артикул бренда",
-            p.brand AS "Бренд",
-            pd.representative_name AS "Наименование",
-            pd.representative_applicability AS "Применимость",
-            p.description AS "Описание",
-            pd.representative_category AS "Категория товара",
-            p.multiplicity AS "Кратность",
-            p.length AS "Длинна",
-            p.width AS "Ширина",
-            p.height AS "Высота",
-            p.weight AS "Вес",
-            p.dimensions_str AS "Длинна/Ширина/Высота",
-            pd.oe_list AS "OE номер",
-            aa.analog_list AS "аналоги",
-            p.image_url AS "Ссылка на изображение"
-        FROM parts_data p
-        LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
-        LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
-        WHERE pd.oe_list IS NOT NULL
-        ORDER BY p.brand, p.artikul
-        """
-
-    def build_export_query(self, selected_columns: List[str] | None) -> str:
-        # Стандартное описание
-        standard_description = """Состояние товара: новый (в упаковке).
-Высококачественные автозапчасти и автотовары — надежное решение для вашего автомобиля. 
-Обеспечьте безопасность, долговечность и высокую производительность вашего авто с помощью нашего широкого ассортимента оригинальных и совместимых автозапчастей.
-
-В нашем каталоге вы найдете тормозные системы, фильтры (масляные, воздушные, салонные), свечи зажигания, расходные материалы, автохимию, электрику, автомасла, инструмент, а также другие комплектующие, полностью соответствующие стандартам качества и безопасности. 
-
-Мы гарантируем быструю доставку, выгодные цены и профессиональную консультацию для любого клиента — автолюбителя, специалиста или автосервиса. 
-
-Выбирайте только лучшее — надежность и качество от ведущих производителей."""
-        # Задаем отображение колонок
-        columns_map = [
-            ("Артикул бренда", 'r.artikul AS "Артикул бренда"'),
-            ("Бренд", 'r.brand AS "Бренд"'),
-            ("Наименование", 'COALESCE(r.representative_name, r.analog_representative_name) AS "Наименование"'),
-            ("Применимость", 'COALESCE(r.representative_applicability, r.analog_representative_applicability) AS "Применимость"'),
-            ("Описание", "CONCAT(COALESCE(r.description, ''), dt.text) AS \"Описание\""),
-            ("Категория товара", 'COALESCE(r.representative_category, r.analog_representative_category) AS "Категория товара"'),
-            ("Кратность", 'r.multiplicity AS "Кратность"'),
-            ("Длинна", 'COALESCE(r.length, r.analog_length) AS "Длинна"'),
-            ("Ширина", 'COALESCE(r.width, r.analog_width) AS "Ширина"'),
-            ("Высота", 'COALESCE(r.height, r.analog_height) AS "Высота"'),
-            ("Вес", 'COALESCE(r.weight, r.analog_weight) AS "Вес"'),
-            ("Длинна/Ширина/Высота", "COALESCE(CASE WHEN r.dimensions_str IS NULL OR r.dimensions_str = '' OR UPPER(TRIM(r.dimensions_str)) = 'XX' THEN NULL ELSE r.dimensions_str END, r.analog_dimensions_str) AS \"Длинна/Ширина/Высота\""),
-            ("OE номер", 'r.oe_list AS "OE номер"'),
-            ("аналоги", 'r.analog_list AS "аналоги"'),
-            ("Ссылка на изображение", 'r.image_url AS "Ссылка на изображение"')
-        ]
-
-        # Обработка исключений
-        exclude_input = st.session_state.get('exclude_positions', '')
-        exclude_filter_sql = ""
-        if exclude_input:
-            exclude_filter_sql = self.generate_exclude_filter(exclude_input)
-
-        if not selected_columns:
-            selected_exprs = [expr for _, expr in columns_map]
-        else:
-            selected_exprs = [expr for name, expr in columns_map if name in selected_columns]
-            if not selected_exprs:
-                selected_exprs = [expr for _, expr in columns_map]
-
-        ctes = f"""
-        WITH DescriptionTemplate AS (
-            SELECT CHR(10) || CHR(10) || $${standard_description}$$ AS text
-        ),
-        PartDetails AS (
-            SELECT
-                cr.artikul_norm,
-                cr.brand_norm,
-                STRING_AGG(DISTINCT regexp_replace(regexp_replace(o.oe_number, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\\-\\s]', '', 'g'), ', ') AS oe_list,
-                ANY_VALUE(o.name) AS representative_name,
-                ANY_VALUE(o.applicability) AS representative_applicability,
-                ANY_VALUE(o.category) AS representative_category
-            FROM cross_references cr
-            JOIN oe_data o ON cr.oe_number_norm = o.oe_number_norm
-            GROUP BY cr.artikul_norm, cr.brand_norm
-        ),
-        AllAnalogs AS (
-            SELECT
-                cr1.artikul_norm,
-                cr1.brand_norm,
-                STRING_AGG(DISTINCT regexp_replace(regexp_replace(p2.artikul, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\\-\\s]', '', 'g'), ', ') as analog_list
             FROM cross_references cr1
             JOIN cross_references cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
             JOIN parts_data p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
@@ -619,8 +526,8 @@ class HighVolumeAutoPartsCatalog:
 
         # Включаем условие исключений
         where_clause = ""
-        if exclude_filter_sql:
-            where_clause = f"\nWHERE {exclude_filter_sql} AND rn = 1"
+        if hasattr(self, 'exclude_filter_sql') and self.exclude_filter_sql:
+            where_clause = f"\nWHERE {self.exclude_filter_sql} AND rn = 1"
         else:
             where_clause = "\nWHERE rn = 1"
 
@@ -652,7 +559,7 @@ class HighVolumeAutoPartsCatalog:
             return False
         st.info(f"📤 Экспорт {total_records:,} записей в CSV...")
         try:
-            query = self.build_export_query(selected_columns)
+            query = self.get_export_query()
             df = self.conn.execute(query).pl()
             # Преобразуем числовые
             dimension_cols = ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]
@@ -686,7 +593,7 @@ class HighVolumeAutoPartsCatalog:
         st.info(f"📤 Экспорт {total_records:,} записей в Excel...")
         try:
             num_files = (total_records + EXCEL_ROW_LIMIT - 1) // EXCEL_ROW_LIMIT
-            base_query = self.build_export_query(selected_columns)
+            base_query = self.get_export_query()
             exported_files = []
             progress_bar = st.progress(0, text=f"Подготовка к экспорту {num_files} файла(ов)...")
             for i in range(num_files):
@@ -734,7 +641,7 @@ class HighVolumeAutoPartsCatalog:
             return False
         st.info(f"📤 Экспорт {total_records:,} записей в Parquet...")
         try:
-            query = self.build_export_query(selected_columns)
+            query = self.get_export_query()
             df = self.conn.execute(query).pl()
             df.write_parquet(output_path)
             file_size = os.path.getsize(output_path) / (1024 * 1024)
@@ -767,7 +674,7 @@ class HighVolumeAutoPartsCatalog:
         export_format = st.radio("Выберите формат экспорта:", ["CSV", "Excel (.xlsx)", "Parquet (для разработчиков)"], index=0)
 
         if export_format == "CSV":
-            if st.button("🚀 Экспорт в CSV", type="primary"):
+            if st.button("🚀 Экспорт в CSV", key='export_csv'):
                 output_path = self.data_dir / "auto_parts_report.csv"
                 with st.spinner("Идет экспорт в CSV..."):
                     success = self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None)
@@ -776,7 +683,7 @@ class HighVolumeAutoPartsCatalog:
                         st.download_button("📥 Скачать CSV файл", f, "auto_parts_report.csv", "text/csv")
         elif export_format == "Excel (.xlsx)":
             st.info("ℹ️ Если записей больше 1 млн, результат будет разделен на несколько файлов и упакован в ZIP-архив.")
-            if st.button("📊 Экспорт в Excel", type="primary"):
+            if st.button("📊 Экспорт в Excel", key='export_excel'):
                 output_path = self.data_dir / "auto_parts_report.xlsx"
                 with st.spinner("Идет экспорт в Excel..."):
                     success, final_path = self.export_to_excel(output_path, selected_columns if selected_columns else None)
@@ -785,7 +692,7 @@ class HighVolumeAutoPartsCatalog:
                         mime = "application/zip" if final_path.suffix == ".zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         st.download_button(f"📥 Скачать {final_path.name}", f, final_path.name, mime)
         elif export_format == "Parquet (для разработчиков)":
-            if st.button("⚡️ Экспорт в Parquet", type="primary"):
+            if st.button("⚡️ Экспорт в Parquet", key='export_parquet'):
                 output_path = self.data_dir / "auto_parts_report.parquet"
                 with st.spinner("Идет экспорт в Parquet..."):
                     success = self.export_to_parquet(str(output_path), selected_columns if selected_columns else None)
@@ -947,7 +854,7 @@ def main():
             'oe': oe_file, 'cross': cross_file, 'barcode': barcode_file,
             'dimensions': dimensions_file, 'images': images_file
         }
-        if st.button("🚀 Начать обработку данных", type="primary"):
+        if st.button("🚀 Начать обработку данных", key='start_processing'):
             paths_to_process = {}
             uploaded_files_count = 0
             for ftype, uploaded_file in file_map.items():
@@ -1020,20 +927,20 @@ def main():
                 count_res = catalog.conn.execute("SELECT COUNT(*) FROM parts_data WHERE brand_norm = ?", [brand_norm]).fetchone()
                 count_del = count_res[0] if count_res else 0
                 st.info(f"Удаляется {count_del} записей для бренда '{selected_brand}'")
-                if st.button("❌ Удалить все для бренда"):
+                if st.button("❌ Удалить все для бренда", key='delete_brand'):
                     deleted = catalog.delete_by_brand(brand_norm)
                     st.success(f"Удалено {deleted} записей")
             else:
                 st.warning("Нет доступных брендов.")
         else:
             # Удаление по артикулу
-            artikul_input = st.text_input("Артикул для удаления")
+            artikul_input = st.text_input("Артикул для удаления", key='artikul_delete')
             if artikul_input:
                 artikul_norm = catalog.normalize_key(pl.Series([artikul_input]))[0]
                 count_res = catalog.conn.execute("SELECT COUNT(*) FROM parts_data WHERE artikul_norm = ?", [artikul_norm]).fetchone()
-                count_del = count_res[0] if count_res else 0
-                st.info(f"Удаляется {count_del} записей для артикула '{artikul_input}'")
-                if st.button("❌ Удалить по артикулу"):
+                deleted_count = count_res[0] if count_res else 0
+                st.info(f"Удаляется {deleted_count} записей для артикула '{artikul_input}'")
+                if st.button("❌ Удалить по артикулу", key='delete_artikul'):
                     deleted = catalog.delete_by_artikul(artikul_norm)
                     st.success(f"Удалено {deleted} записей")
     # Добавление разделов для загрузки цен и установки наценки
@@ -1044,16 +951,20 @@ def main():
             temp_path = catalog.data_dir / f"recommended_prices_{int(time.time())}.xlsx"
             with open(temp_path, "wb") as f:
                 f.write(price_file.getvalue())
-            if st.button("Загрузить цены из файла"):
+            if st.button("Загрузить цены из файла", key='load_prices'):
                 catalog.load_recommended_prices(str(temp_path))
     with st.expander("Общая наценка"):
-        markup_percent = st.number_input("Процент наценки", min_value=0.0, max_value=100.0, step=0.1)
-        if st.button("Установить общую наценку"):
+        markup_percent = st.number_input(
+            "Процент наценки", min_value=0.0, max_value=100.0, step=0.1, key='global_markup_percent'
+        )
+        if st.button("Установить общую наценку", key='set_global_markup'):
             catalog.set_global_markup(markup_percent)
     with st.expander("Наценка по бренду"):
-        brand_name = st.text_input("Название бренда")
-        brand_markup_percent = st.number_input("Процент наценки", min_value=0.0, max_value=100.0, step=0.1)
-        if st.button("Установить для бренда"):
+        brand_name = st.text_input("Название бренда", key='brand_name_markup')
+        brand_markup_percent = st.number_input(
+            "Процент наценки", min_value=0.0, max_value=100.0, step=0.1, key='brand_markup_percent'
+        )
+        if st.button("Установить для бренда", key='set_brand_markup'):
             if brand_name:
                 catalog.set_brand_markup(brand_name, brand_markup_percent)
             else:
