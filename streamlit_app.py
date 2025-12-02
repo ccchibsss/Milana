@@ -22,11 +22,11 @@ class AutoPartsCatalog:
         self.load_recommended_prices()
 
         self.categories = {}  # категории по ключу
-        self.brand_markups: Dict[str, float] = {}
+        self.brand_markups: dict = {}
         self.global_markup: float = 0.0
 
     def setup_database(self):
-        # Создание таблиц
+        # Создаем таблицы
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe_data (
                 oe_number_norm VARCHAR PRIMARY KEY,
@@ -45,10 +45,6 @@ class AutoPartsCatalog:
                 category VARCHAR,
                 multiplicity INTEGER,
                 barcode VARCHAR,
-                length DOUBLE,
-                width DOUBLE,
-                height DOUBLE,
-                weight DOUBLE,
                 image_url VARCHAR,
                 dimensions_str VARCHAR,
                 description VARCHAR,
@@ -63,6 +59,15 @@ class AutoPartsCatalog:
                 artikul_norm VARCHAR,
                 brand_norm VARCHAR,
                 PRIMARY KEY (oe_number_norm, artikul_norm, brand_norm)
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS supplier_prices (
+                artikul VARCHAR,
+                quantity INTEGER,
+                brand VARCHAR,
+                supplier_price DOUBLE,
+                PRIMARY KEY (artikul, brand)
             )
         """)
         self.conn.execute("""
@@ -84,7 +89,7 @@ class AutoPartsCatalog:
                 global_markup DOUBLE
             )
         """)
-        # Инициализация глобальной наценки
+        # Инициализация
         self.conn.execute("INSERT OR IGNORE INTO markup_settings (id, global_markup) VALUES (1, 0.0)")
 
     def load_recommended_prices(self):
@@ -97,7 +102,7 @@ class AutoPartsCatalog:
                     INSERT OR REPLACE INTO prices (artikul, recommended_price, brand)
                     VALUES (?, ?, ?)
                 """, [artikul, price, brand])
-            st.success("Рекомендованные цены загружены.")
+            st.info("Рекомендованные цены загружены.")
         else:
             pass
 
@@ -131,9 +136,10 @@ class AutoPartsCatalog:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prices ON prices(artikul)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_categories ON categories(key)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_markup ON markup_settings(id)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_supplier ON supplier_prices(artikul, brand)")
 
     @staticmethod
-    def normalize_key(series: pl.Series) -> pl.Series:
+    def normalize_key(series):
         return (
             series
             .fill_null("")
@@ -146,7 +152,7 @@ class AutoPartsCatalog:
         )
 
     @staticmethod
-    def clean_values(series: pl.Series) -> pl.Series:
+    def clean_values(series):
         return (
             series
             .fill_null("")
@@ -157,7 +163,7 @@ class AutoPartsCatalog:
             .str.strip_chars()
         )
 
-    def detect_columns(self, actual_cols: list, expected_cols: list) -> dict:
+    def detect_columns(self, actual_cols, expected_cols):
         mapping = {}
         col_variants = {
             'oe_number': ['oe номер', 'oe', 'оe', 'номер', 'code', 'OE'],
@@ -202,15 +208,18 @@ class AutoPartsCatalog:
             if not col_map:
                 return pl.DataFrame()
             df = df.rename(col_map)
+            # Очистка
             if 'artikul' in df.columns:
                 df = df.with_columns(artikul=self.clean_values(pl.col('artikul')))
             if 'brand' in df.columns:
                 df = df.with_columns(brand=self.clean_values(pl.col('brand')))
             if 'oe_number' in df.columns:
                 df = df.with_columns(oe_number=self.clean_values(pl.col('oe_number')))
+            # Удаление дубликатов
             key_cols = [c for c in ['oe_number', 'artikul', 'brand'] if c in df.columns]
             if key_cols:
                 df = df.unique(subset=key_cols, keep='first')
+            # Нормализация ключей
             if 'artikul' in df.columns:
                 df = df.with_columns(artikul_norm=self.normalize_key(pl.col('artikul')))
             if 'brand' in df.columns:
@@ -218,7 +227,8 @@ class AutoPartsCatalog:
             if 'oe_number' in df.columns:
                 df = df.with_columns(oe_number_norm=self.normalize_key(pl.col('oe_number')))
             return df
-        except:
+        except Exception as e:
+            st.error(f"Ошибка при чтении файла {file_path}: {e}")
             return pl.DataFrame()
 
     def upsert(self, table: str, df: pl.DataFrame, pk: list):
@@ -276,43 +286,18 @@ class AutoPartsCatalog:
         prices_df = self.conn.execute("SELECT artikul, recommended_price, brand FROM prices").pl()
         if not all_parts.is_empty():
             all_parts = all_parts.join(prices_df, on='artikul', how='left')
-            # размеры
+            # Размеры
             for c in ['length', 'width', 'height']:
                 if c not in all_parts.columns:
                     all_parts = all_parts.with_columns(pl.lit(None).cast(pl.Float64).alias(c))
             if 'dimensions_str' not in all_parts.columns:
                 all_parts = all_parts.with_columns(dimensions_str=pl.lit(''))
-            # размеры строк
-            all_parts = all_parts.with_columns([
-                pl.col('length').cast(pl.Utf8).fill_null('').alias('_length_str'),
-                pl.col('width').cast(pl.Utf8).fill_null('').alias('_width_str'),
-                pl.col('height').cast(pl.Utf8).fill_null('').alias('_height_str'),
-            ])
-            all_parts = all_parts.with_columns(
-                pl.when(pl.col('dimensions_str') != '').then(pl.col('dimensions_str'))
-                .otherwise(pl.concat_str([pl.col('_length_str'), pl.lit('x'), pl.col('_width_str'), pl.lit('x'), pl.col('_height_str')], separator=''))
-                .alias('dimensions_str')
-            ).drop(['_length_str', '_width_str', '_height_str'])
-            # описание
+            # Описание
             if 'artikul' not in all_parts.columns:
                 all_parts = all_parts.with_columns(artikul=pl.lit(''))
             if 'brand' not in all_parts.columns:
                 all_parts = all_parts.with_columns(brand=pl.lit(''))
-            all_parts = all_parts.with_columns([
-                pl.col('artikul').cast(pl.Utf8).fill_null('').alias('_artikul'),
-                pl.col('brand').cast(pl.Utf8).fill_null('').alias('_brand'),
-                pl.col('recommended_price').fill_null(0).cast(pl.Float64).alias('_rec_price'),
-                pl.col('multiplicity').fill_null(1).cast(pl.Int32).alias('multiplicity'),
-            ])
-            all_parts = all_parts.with_columns(
-                pl.concat_str([
-                    'Артикул: ', pl.col('_artikul'),
-                    ', Бренд: ', pl.col('_brand'),
-                    ', Кратность: ', pl.col('multiplicity').cast(pl.Utf8),
-                    ' шт.'
-                ], separator='').alias('description')
-            )
-            # расчет цены с наценкой
+            # Расчет цены с наценкой
             def compute_price(row):
                 base_price = row['recommended_price']
                 if base_price is None or base_price == 0:
@@ -328,7 +313,7 @@ class AutoPartsCatalog:
                 .alias('price_with_markup')
             )
 
-            # финальные колонки
+            # Финальные колонки
             all_parts = all_parts.select([
                 'artikul_norm', 'brand_norm', 'artikul', 'brand', 'category', 'multiplicity', 'barcode',
                 'length', 'width', 'height', 'weight', 'image_url', 'dimensions_str', 'description', 'price_with_markup'
@@ -336,8 +321,30 @@ class AutoPartsCatalog:
 
             self.upsert('parts_data', all_parts, ['artikul_norm', 'brand_norm'])
 
+        # Работа с прайсами поставщиков
+        self.handle_supplier_prices()
+
         self.create_indexes()
         st.success("Обработка завершена.")
+
+    def handle_supplier_prices(self):
+        # Предположим, что у вас есть файл с прайсами поставщиков (артикул, кол-во, бренд, цена)
+        # В реальности его нужно загрузить и обработать, например, из файла или базы.
+        # Для примера создадим фиктивные данные или добавим сюда код загрузки файла.
+        # Пока что заглушка:
+        # Пример загрузки из файла:
+        uploaded = st.file_uploader("Загрузить прайсы поставщиков (Excel)", type=['xlsx','xls'])
+        if uploaded:
+            df_sup = pl.read_excel(uploaded)
+            # Предположим, структура: артикул, количество, бренд, цена
+            for row in df_sup.rows():
+                artikul, quantity, brand, price = row
+                self.conn.execute("""
+                    INSERT OR REPLACE INTO supplier_prices (artikul, quantity, brand, supplier_price)
+                    VALUES (?, ?, ?, ?)
+                """, [artikul, quantity, brand, price])
+            st.success("Прайсы поставщиков загружены.")
+        # Можно дополнительно связать с артикулами в части или таблице цен.
 
     def get_total_parts(self):
         return self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()[0]
@@ -357,7 +364,7 @@ class AutoPartsCatalog:
         }
 
     def build_export_query(self, selected_cols=None, exclude_terms=None, filters=None):
-        # Создание SQL-запроса для экспорта
+        # Построение SQL для экспорта
         exclude_where = ""
         if exclude_terms:
             clauses = []
@@ -384,6 +391,7 @@ class AutoPartsCatalog:
                 filter_clauses.append(f"p.artikul IN ({arts_list})")
             if 'oe' in filters:
                 o_list = ", ".join([f"'{o}'" for o in filters['oe']])
+                # Предположим, что связка с oe_data
                 filter_clauses.append(f"pd.oe_list LIKE ANY (ARRAY[{o_list}])")
         filter_where = ""
         if filter_clauses:
@@ -421,15 +429,7 @@ class AutoPartsCatalog:
 
         query = f"""
         WITH DescriptionText AS (
-            SELECT CHR(10) || CHR(10) || $${"""Состояние товара: новый (в упаковке).
-Высококачественные автозапчасти и автотовары — надежное решение для вашего автомобиля. 
-Обеспечьте безопасность, долговечность и высокую производительность вашего авто с помощью нашего широкого ассортимента оригинальных и совместимых автозапчастей.
-
-В нашем каталоге вы найдете тормозные системы, фильтры (масляные, воздушные, салонные), свечи зажигания, расходные материалы, автохимию, электрику, автомасла, инструмент, а также другие комплектующие, полностью соответствующие стандартам качества и безопасности. 
-
-Мы гарантируем быструю доставку, выгодные цены и профессиональную консультацию для любого клиента — автолюбителя, специалиста или автосервиса. 
-
-Выбирайте только лучшее — надежность и качество от ведущих производителей."""}$$ AS text
+            SELECT ' ' AS text
         ),
         pd AS (
             SELECT
@@ -456,16 +456,17 @@ class AutoPartsCatalog:
         )
         SELECT
             {', '.join(selected_exprs)}
-        FROM ranked r
+        FROM parts_data p
+        LEFT JOIN pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
+        LEFT JOIN aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
         LEFT JOIN DescriptionText dt ON 1=1
-        WHERE r.rn=1
-        {('AND ' + filter_where) if filter_where else ''}
-        {('AND ' + exclude_where) if exclude_where else ''}
-        ORDER BY r.brand, r.artikul
+        {filter_where}
+        {(' AND ' + exclude_where[6:]) if exclude_where else ''}
+        ORDER BY p.brand, p.artikul
         """
         return query
 
-    def export_csv(self, output_path: str, selected_cols=None, exclude_terms=None, filters=None):
+    def export_csv(self, output_path, selected_cols=None, exclude_terms=None, filters=None):
         total = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)").fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
@@ -483,11 +484,9 @@ class AutoPartsCatalog:
                 )
         buf = io.StringIO()
         df.write_csv(buf, separator=';')
-        with open(output_path, 'wb') as f:
-            f.write(b'\xef\xbb\xbf')
-            f.write(buf.getvalue().encode('utf-8'))
-        size_mb = os.path.getsize(output_path) / 1024 / 1024
-        st.success(f"Экспортировано {total:,} записей. Размер файла: {size_mb:.2f} МБ")
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(buf.getvalue())
+        st.success(f"Экспортировано {total:,} записей.")
         return True
 
     def export_excel(self, output_path: Path, selected_cols=None, exclude_terms=None, filters=None):
@@ -496,10 +495,12 @@ class AutoPartsCatalog:
             st.warning("Нет данных для экспорта")
             return False, None
         num_files = (total + EXCEL_ROW_LIMIT - 1) // EXCEL_ROW_LIMIT
+        filenames = []
         for i in range(num_files):
             offset = i * EXCEL_ROW_LIMIT
             query = self.build_export_query(selected_cols, exclude_terms, filters) + f" LIMIT {EXCEL_ROW_LIMIT} OFFSET {offset}"
             df = self.conn.execute(query).pl()
+            # Форматировать размеры и цену
             for c in ["Длинна", "Ширина", "Высота", "Цена с наценкой"]:
                 if c in df.columns:
                     df = df.with_columns(
@@ -510,18 +511,18 @@ class AutoPartsCatalog:
                     )
             filename = output_path.with_name(f"{output_path.stem}_part_{i+1}.xlsx")
             df.write_excel(str(filename))
+            filenames.append(filename)
         if num_files > 1:
             zip_path = output_path.with_suffix('.zip')
             with zipfile.ZipFile(zip_path, 'w') as zipf:
-                for i in range(num_files):
-                    filename = output_path.with_name(f"{output_path.stem}_part_{i+1}.xlsx")
+                for filename in filenames:
                     zipf.write(str(filename), filename.name)
                     os.remove(str(filename))
             return True, zip_path
         else:
-            return True, output_path
+            return True, filenames[0]
 
-    def export_parquet(self, output_path: str, selected_cols=None, exclude_terms=None, filters=None):
+    def export_parquet(self, output_path, selected_cols=None, exclude_terms=None, filters=None):
         total = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)").fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
@@ -542,13 +543,13 @@ class AutoPartsCatalog:
 
         # Фильтры
         st.subheader("Фильтры")
-        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].drop_nulls().to_list()
+        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].dropna().tolist()
         selected_brands = st.multiselect("Бренды", options=brands)
-        categories = self.conn.execute("SELECT DISTINCT category FROM oe_data").fetchdf()['category'].drop_nulls().to_list()
+        categories = self.conn.execute("SELECT DISTINCT category FROM oe_data").fetchdf()['category'].dropna().tolist()
         selected_categories = st.multiselect("Категории", options=categories)
-        arts = self.conn.execute("SELECT DISTINCT artikul FROM parts_data").fetchdf()['artikul'].drop_nulls().to_list()
+        arts = self.conn.execute("SELECT DISTINCT artikul FROM parts_data").fetchdf()['artikul'].dropna().tolist()
         selected_arts = st.multiselect("Артикулы", options=arts)
-        o_list = self.conn.execute("SELECT DISTINCT oe_number FROM oe_data").fetchdf()['oe_number'].drop_nulls().to_list()
+        o_list = self.conn.execute("SELECT DISTINCT oe_number FROM oe_data").fetchdf()['oe_number'].dropna().tolist()
         selected_oes = st.multiselect("OE номера", options=o_list)
 
         filters = {}
@@ -571,35 +572,33 @@ class AutoPartsCatalog:
 
         format_choice = st.radio("Формат экспорта", ["CSV", "Excel (.xlsx)", "Parquet"])
         if st.button("Экспортировать"):
+            filename = self.data_dir / "auto_parts_export"
             if format_choice == "CSV":
-                filename = self.data_dir / "auto_parts_export.csv"
-                self.export_csv(str(filename), selected_cols, exclude_terms=None, filters=filters)
-                with open(str(filename), "rb") as f:
+                full_path = filename.with_suffix('.csv')
+                self.export_csv(str(full_path), selected_cols, exclude_terms=None, filters=filters)
+                with open(str(full_path), "rb") as f:
                     st.download_button("📥 Скачать CSV", f, "auto_parts_export.csv", "text/csv")
             elif format_choice == "Excel (.xlsx)":
-                filename = self.data_dir / "auto_parts_export.xlsx"
-                success, final_path = self.export_excel(filename, selected_cols, exclude_terms=None, filters=filters)
-                if success and final_path:
-                    with open(str(final_path), "rb") as f:
-                        mime = "application/zip" if final_path.suffix == ".zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        st.download_button("📥 Скачать файл", f, final_path.name, mime)
+                success, out_path = self.export_excel(filename, selected_cols, exclude_terms=None, filters=filters)
+                if success and out_path:
+                    with open(str(out_path), "rb") as f:
+                        st.download_button("📥 Скачать Excel", f, out_path.name, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
             else:
-                filename = self.data_dir / "auto_parts_export.parquet"
-                self.export_parquet(str(filename), selected_cols, exclude_terms=None, filters=filters)
-                with open(str(filename), "rb") as f:
+                out_path = filename.with_suffix('.parquet')
+                self.export_parquet(str(out_path), selected_cols, exclude_terms=None, filters=filters)
+                with open(str(out_path), "rb") as f:
                     st.download_button("📥 Скачать Parquet", f, "auto_parts_export.parquet", "application/octet-stream")
 
     def show_settings_ui(self):
         st.header("⚙️ Настройки")
         st.subheader("Наценки")
-        # Общая
         new_markup = st.slider("Общая наценка (%)", 0.0, 100.0, value=self.get_global_markup(), step=0.5)
         if st.button("Применить общую наценку"):
             self.set_global_markup(new_markup)
             st.success(f"Общая наценка установлена {new_markup}%")
-        # Бренды
+        # Для брендов
         st.subheader("Наценки по брендам")
-        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].drop_nulls().to_list()
+        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].dropna().tolist()
         for b in brands:
             current_markup = self.get_brand_markup(b)
             new_b_markup = st.slider(f"Наценка для '{b}'", 0.0, 100.0, value=current_markup, step=0.5)
@@ -624,12 +623,12 @@ class AutoPartsCatalog:
         for k, v in self.categories.items():
             st.write(f"{k}: {v}")
 
-    def delete_brand(self, brand_norm: str):
+    def delete_brand(self, brand_norm):
         count = self.conn.execute("DELETE FROM parts_data WHERE brand_norm=?", [brand_norm]).fetchone()[0]
         self.conn.execute("DELETE FROM cross_references WHERE (artikul_norm, brand_norm) NOT IN (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)")
         return count
 
-    def delete_artikul(self, artikul_norm: str):
+    def delete_artikul(self, artikul_norm):
         count = self.conn.execute("DELETE FROM parts_data WHERE artikul_norm=?", [artikul_norm]).fetchone()[0]
         self.conn.execute("DELETE FROM cross_references WHERE (artikul_norm, brand_norm) NOT IN (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)")
         return count
@@ -659,12 +658,12 @@ def main():
             st.info("База содержит данные. Можно добавлять или обновлять файлы.")
         col1, col2 = st.columns(2)
         with col1:
-            file_oe = st.file_uploader("Основные данные (OE)", type=['xlsx','xls'])
-            file_cross = st.file_uploader("Кроссы", type=['xlsx','xls'])
-            file_prices = st.file_uploader("Цены (рекомендованные)", type=['xlsx','xls'])
+            file_oe = st.file_uploader("Основные данные (OE)", type=['xlsx', 'xls'])
+            file_cross = st.file_uploader("Кроссы", type=['xlsx', 'xls'])
+            file_prices = st.file_uploader("Цены (рекомендованные)", type=['xlsx', 'xls'])
         with col2:
-            file_dim = st.file_uploader("Весогабариты", type=['xlsx','xls'])
-            file_img = st.file_uploader("Изображения", type=['xlsx','xls'])
+            file_dim = st.file_uploader("Весогабариты", type=['xlsx', 'xls'])
+            file_img = st.file_uploader("Изображения", type=['xlsx', 'xls'])
         files_map = {
             'oe': file_oe,
             'cross': file_cross,
@@ -682,10 +681,6 @@ def main():
                     df = catalog.read_and_prepare_file(str(path), key)
                     dfs[key] = df
             catalog.process_and_load(dfs)
-            # Обновление цен
-            if files_map['prices']:
-                df_prices = pl.read_excel(str(path))
-                catalog.save_recommended_prices(df_prices)
 
     elif menu == "Настройки":
         catalog.show_settings_ui()
@@ -708,7 +703,7 @@ def main():
         st.header("🗑️ Управление данными")
         action = st.radio("Действие", ["Удалить по бренду", "Удалить по артикулу", "Редактировать цены"])
         if action == "Удалить по бренду":
-            brands = catalog.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].drop_nulls().to_list()
+            brands = catalog.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].dropna().tolist()
             if not brands:
                 st.info("Нет брендов для удаления.")
             else:
