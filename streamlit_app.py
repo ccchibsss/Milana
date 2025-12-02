@@ -19,11 +19,10 @@ if platform.architecture()[0] != '64bit':
 import warnings
 warnings.filterwarnings('ignore')
 
-# Импортируем polars и проверяем его версию
 import polars as pl
+from packaging import version
 
 # Проверка версии polars >= 0.19.0
-from packaging import version
 if version.parse(pl.__version__) < version.parse("0.19.0"):
     print(f"❌ Требуется polars >= 0.19.0, у вас установлена версия {pl.__version__}. Обновите библиотеку.")
     sys.exit(1)
@@ -37,10 +36,9 @@ import zipfile
 from pathlib import Path
 from typing import Dict, List
 
-# Остальной ваш код без изменений ниже...
-
 EXCEL_ROW_LIMIT = 1_000_000
 
+# Ваша основная класс-логика
 class HighVolumeAutoPartsCatalog:
     def __init__(self):
         self.data_dir = Path("./auto_parts_data")
@@ -50,8 +48,8 @@ class HighVolumeAutoPartsCatalog:
         self.setup_database()
 
         # Настройки наценки
-        self.overall_markup = 0.0  # в процентах
-        self.brand_markups: Dict[str, float] = {}  # по брендам
+        self.overall_markup = 0.0
+        self.brand_markups: Dict[str, float] = {}
 
         st.set_page_config(
             page_title="AutoParts Catalog 10M+", 
@@ -60,7 +58,7 @@ class HighVolumeAutoPartsCatalog:
         )
 
     def setup_database(self):
-        # Таблица с артикулом и прочими данными
+        # Создание таблиц
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe_data (
                 oe_number_norm VARCHAR PRIMARY KEY,
@@ -70,7 +68,6 @@ class HighVolumeAutoPartsCatalog:
                 category VARCHAR
             )
         """)
-        # Таблица с артикулами
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS parts_data (
                 artikul_norm VARCHAR,
@@ -89,7 +86,6 @@ class HighVolumeAutoPartsCatalog:
                 PRIMARY KEY (artikul_norm, brand_norm)
             )
         """)
-        # Таблица с кроссами
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS cross_references (
                 oe_number_norm VARCHAR,
@@ -98,7 +94,6 @@ class HighVolumeAutoPartsCatalog:
                 PRIMARY KEY (oe_number_norm, artikul_norm, brand_norm)
             )
         """)
-        # Таблица с рекомендованными ценами
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS recommended_prices (
                 artikul_norm VARCHAR,
@@ -109,7 +104,6 @@ class HighVolumeAutoPartsCatalog:
         """)
 
     def create_indexes(self):
-        # Создание индексов для ускорения поиска
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_oe_data_oe ON oe_data(oe_number_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_parts_data_keys ON parts_data(artikul_norm, brand_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_oe ON cross_references(oe_number_norm)")
@@ -129,39 +123,15 @@ class HighVolumeAutoPartsCatalog:
             .str.to_lowercase()
         )
 
-    def upsert_recommended_prices(self, df: pl.DataFrame):
-        # Обновление или вставка цен
-        df = df.with_columns(
-            artikul_norm=self.normalize_key(pl.col('artikul')),
-            brand_norm=self.normalize_key(pl.col('brand')),
-            recommended_price=pl.col('recommended_price').cast(pl.Float64)
-        )
-        # UPSERT
-        for row in df.iter_rows():
-            self.conn.execute("""
-                INSERT INTO recommended_prices (artikul_norm, brand_norm, recommended_price)
-                VALUES (?, ?, ?)
-                ON CONFLICT (artikul_norm, brand_norm) DO UPDATE SET recommended_price=excluded.recommended_price
-            """, [row[1], row[2], row[3]])
-
-    def load_recommended_prices(self, file_path: str):
-        df = pl.read_excel(file_path, engine='calamine')
-        # Предполагаемый формат: артикул, бренд, цена
-        # Проверка и переименование колонок
-        # Можно добавить проверки, чтобы убедиться в наличии колонок
-        df = df.rename({df.columns[0]: 'artikul', df.columns[1]: 'brand', df.columns[2]: 'recommended_price'})
-        self.upsert_recommended_prices(df)
+    def get_brand_markup(self, brand_norm: str) -> float:
+        return self.brand_markups.get(brand_norm.lower(), self.overall_markup)
 
     def set_markup(self, overall: float, brand_markups: Dict[str, float]):
         self.overall_markup = overall
         self.brand_markups = brand_markups
 
-    def get_brand_markup(self, brand_norm: str) -> float:
-        return self.brand_markups.get(brand_norm, self.overall_markup)
-
-    def build_export_query(self, selected_columns: List[str] | None, exclude_terms: str = "") -> str:
-        # Вводим параметры
-        # Создаем CTE с текстом описания
+    def build_export_query(self, selected_columns: List[str] | None, exclude_terms: str = "") -> (str, List):
+        # Внутренний метод: возвращает SQL-запрос и параметры
         standard_description = """Состояние товара: новый (в упаковке).
 Высококачественные автозапчасти и автотовары — надежное решение для вашего автомобиля. 
 Обеспечьте безопасность, долговечность и высокую производительность вашего авто с помощью нашего широкого ассортимента оригинальных и совместимых автозапчастей.
@@ -171,22 +141,22 @@ class HighVolumeAutoPartsCatalog:
 Мы гарантируем быструю доставку, выгодные цены и профессиональную консультацию для любого клиента — автолюбителя, специалиста или автосервиса. 
 
 Выбирайте только лучшее — надежность и качество от ведущих производителей."""
-        # Формируем условия исключений
+        # Обработка исключений
         exclude_sql = ""
         params = []
 
         if exclude_terms:
             terms = [term.strip() for term in exclude_terms.split('|') if term.strip()]
-            # точное совпадение
+            # точное исключение
             for term in terms:
                 exclude_sql += " AND r.\"Наименование\" NOT IN ({})".format(', '.join(['?']*len(terms)))
                 params.extend(terms)
-            # частичное совпадение
+            # частичное исключение
             for term in terms:
                 exclude_sql += " AND r.\"Наименование\" NOT LIKE ?"
                 params.append(f"%{term}%")
 
-        # Формируем SELECT выражения в зависимости от выбранных колонок
+        # Формируем SELECT выражения
         columns_map = [
             ("Артикул бренда", 'r.artikul AS "Артикул бренда"'),
             ("Бренд", 'r.brand AS "Бренд"'),
@@ -213,7 +183,7 @@ class HighVolumeAutoPartsCatalog:
             if not selected_exprs:
                 selected_exprs = [expr for _, expr in columns_map]
 
-        # CTE с текстом
+        # Создаем CTE с текстом
         ctes = f"""
         WITH DescriptionTemplate AS (
             SELECT CHR(10) || CHR(10) || $${standard_description}$$ AS text
@@ -339,7 +309,6 @@ class HighVolumeAutoPartsCatalog:
                 p_analog.representative_applicability AS analog_representative_applicability,
                 p_analog.representative_category AS analog_representative_category,
                 ROW_NUMBER() OVER(PARTITION BY p.artikul_norm, p.brand_norm ORDER BY pd.representative_name DESC NULLS LAST, pd.oe_list DESC NULLS LAST) as rn,
-                -- placeholder для final_price
                 0 AS final_price
             FROM parts_data p
             LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
@@ -348,7 +317,7 @@ class HighVolumeAutoPartsCatalog:
         )
         """
 
-        # финальный запрос с расчетом цены
+        # итоговый запрос с расчетом цены
         query = f"""
         {ctes}
         SELECT
@@ -381,7 +350,7 @@ class HighVolumeAutoPartsCatalog:
             query, params = self._build_full_query(selected_columns, exclude_terms)
             df = self.conn.execute(query, params).pl()
 
-            # преобразуем числа
+            # преобразуем числовые колонки
             for col_name in ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]:
                 if col_name in df.columns:
                     df = df.with_columns(
@@ -435,11 +404,6 @@ class HighVolumeAutoPartsCatalog:
         df.write_parquet(output_path)
         return True
 
-    def _build_full_query(self, selected_columns: List[str], exclude_terms: str):
-        # Внутренний вызов для подготовки SQL
-        query, params = self.build_export_query(selected_columns, exclude_terms)
-        return query, params
-
     def show_export_interface(self):
         st.header("📤 Умный экспорт данных")
         total_records = self.conn.execute("SELECT count(DISTINCT (artikul_norm, brand_norm)) FROM parts_data").fetchone()[0]
@@ -487,9 +451,8 @@ class HighVolumeAutoPartsCatalog:
         for ftype, path in files_dict.items():
             if ftype == 'recommended_prices':
                 self.load_recommended_prices(path)
-            # Можно добавить другие загрузки по необходимости
+            # можно добавить другие загрузки
 
-    # Метод для установки наценки
     def configure_markups(self):
         self.overall_markup = st.number_input("Общая наценка (%)", value=0.0, step=1.0)
         brand_markups_input = st.text_area("Наценки по брендам (формат: бренд:процент, через запятую)", value="")
@@ -501,12 +464,8 @@ class HighVolumeAutoPartsCatalog:
                     brand, percent = pair.split(':', 1)
                     self.brand_markups[brand.strip().lower()] = float(percent.strip())
 
-    def get_brand_markup(self, brand_norm: str) -> float:
-        return self.brand_markups.get(brand_norm.lower(), self.overall_markup)
-
-    # Инициализация и запуск
     def run(self):
-        # В UI добавьте загрузку файла цен
+        # Загрузка файла цен
         st.sidebar.header("Загрузка дополнительных данных")
         prices_file = st.sidebar.file_uploader("Загрузить файл с рекомендованными ценами", type=['xlsx', 'xls'])
         if prices_file:
@@ -519,10 +478,10 @@ class HighVolumeAutoPartsCatalog:
         # Настройка наценок
         self.configure_markups()
 
-        # Основной интерфейс
+        # Вызов интерфейса экспорта
         self.show_export_interface()
 
-# В основном запуске
+# Основной запуск
 def main():
     catalog = HighVolumeAutoPartsCatalog()
     catalog.run()
