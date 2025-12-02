@@ -1,35 +1,38 @@
+import os
+import time
+import io
+import zipfile
+import warnings
+import logging
+from pathlib import Path
+from typing import Dict, List
+
 import polars as pl
 import duckdb
 import streamlit as st
-import os
-import time
-import logging
-import io
-import zipfile
-from pathlib import Path
-from typing import Dict, List
-import warnings
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 warnings.filterwarnings('ignore')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
 EXCEL_ROW_LIMIT = 1_000_000
 
 class HighVolumeAutoPartsCatalog:
-    
     def __init__(self):
         self.data_dir = Path("./auto_parts_data")
         self.data_dir.mkdir(exist_ok=True)
         self.db_path = self.data_dir / "catalog.duckdb"
         self.conn = duckdb.connect(database=str(self.db_path))
         self.setup_database()
-        
+
         st.set_page_config(
             page_title="AutoParts Catalog 10M+", 
             layout="wide",
             page_icon="🚗"
         )
-    
+
     def setup_database(self):
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe_data (
@@ -79,7 +82,7 @@ class HighVolumeAutoPartsCatalog:
                 markup FLOAT
             )
         """)
-        
+
     def create_indexes(self):
         st.info("Создание индексов для ускорения поиска...")
         indexes = [
@@ -234,8 +237,8 @@ class HighVolumeAutoPartsCatalog:
         finally:
             self.conn.unregister(temp_view_name)
 
-    def process_and_load_data(self, dataframes: Dict[str, pl.DataFrame]):
-        st.info("🔄 Начало загрузки и обновления данных в базе...")
+    def process_and_load(self, dataframes: Dict[str, pl.DataFrame]):
+        st.info("🔄 Начинаю загрузку и обновление данных в базе...")
         steps = [s for s in ['oe', 'cross', 'parts'] if s in dataframes or s == 'parts']
         num_steps = len(steps)
         progress_bar = st.progress(0, text="Подготовка к обновлению базы данных...")
@@ -350,7 +353,7 @@ class HighVolumeAutoPartsCatalog:
         stats = {}
         st.info("🚀 Начало параллельного чтения и подготовки файлов...")
         n_files = len(file_paths)
-        file_progress_bar = st.progress(0, text=f"Ожидание...")
+        file_progress_bar = st.progress(0, text=f"Обработка файлов...")
         dataframes = {}
         processed_files = 0
         with ThreadPoolExecutor() as executor:
@@ -385,7 +388,7 @@ class HighVolumeAutoPartsCatalog:
         st.success(f"📊 Всего уникальных артикулов в базе: {total_records:,}")
         self.create_indexes()
         return stats
-    
+
     def get_total_records(self) -> int:
         try:
             result = self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()
@@ -394,152 +397,8 @@ class HighVolumeAutoPartsCatalog:
             return 0
 
     def get_export_query(self) -> str:
-        return r"""
-        WITH PartDetails AS (
-            SELECT
-                cr.artikul_norm,
-                cr.brand_norm,
-                STRING_AGG(DISTINCT regexp_replace(regexp_replace(o.oe_number, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\-\s]', '', 'g'), ', ') AS oe_list,
-                ANY_VALUE(o.name) AS representative_name,
-                ANY_VALUE(o.applicability) AS representative_applicability,
-                ANY_VALUE(o.category) AS representative_category
-            FROM cross_references cr
-            JOIN oe_data o ON cr.oe_number_norm = o.oe_number_norm
-            GROUP BY cr.artikul_norm, cr.brand_norm
-        ),
-        AllAnalogs AS (
-            SELECT
-                cr1.artikul_norm,
-                cr1.brand_norm,
-                STRING_AGG(DISTINCT regexp_replace(regexp_replace(p2.artikul, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\-\s]', '', 'g'), ', ') as analog_list
-            FROM cross_references cr1
-            JOIN cross_references cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
-            JOIN parts_data p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
-            WHERE (cr1.artikul_norm != p2.artikul_norm OR cr1.brand_norm != p2.brand_norm)
-            GROUP BY cr1.artikul_norm, cr1.brand_norm
-        ),
-        InitialOENumbers AS (
-            SELECT DISTINCT
-                p.artikul_norm,
-                p.brand_norm,
-                cr.oe_number_norm
-            FROM parts_data p
-            LEFT JOIN cross_references cr ON p.artikul_norm = cr.artikul_norm AND p.brand_norm = cr.brand_norm
-            WHERE cr.oe_number_norm IS NOT NULL
-        ),
-        Level1Analogs AS (
-            SELECT DISTINCT
-                i.artikul_norm AS source_artikul_norm,
-                i.brand_norm AS source_brand_norm,
-                cr2.artikul_norm AS related_artikul_norm,
-                cr2.brand_norm AS related_brand_norm
-            FROM InitialOENumbers i
-            JOIN cross_references cr2 ON i.oe_number_norm = cr2.oe_number_norm
-            WHERE NOT (i.artikul_norm = cr2.artikul_norm AND i.brand_norm = cr2.brand_norm)
-        ),
-        Level1OENumbers AS (
-            SELECT DISTINCT
-                l1.source_artikul_norm,
-                l1.source_brand_norm,
-                cr3.oe_number_norm
-            FROM Level1Analogs l1
-            JOIN cross_references cr3 ON l1.related_artikul_norm = cr3.artikul_norm 
-                                        AND l1.related_brand_norm = cr3.brand_norm
-            WHERE NOT EXISTS (
-                SELECT 1 FROM InitialOENumbers i 
-                WHERE i.artikul_norm = l1.source_artikul_norm 
-                AND i.brand_norm = l1.source_brand_norm 
-                AND i.oe_number_norm = cr3.oe_number_norm
-            )
-        ),
-        Level2Analogs AS (
-            SELECT DISTINCT
-                loe.source_artikul_norm,
-                loe.source_brand_norm,
-                cr4.artikul_norm AS related_artikul_norm,
-                cr4.brand_norm AS related_brand_norm
-            FROM Level1OENumbers loe
-            JOIN cross_references cr4 ON loe.oe_number_norm = cr4.oe_number_norm
-            WHERE NOT (loe.source_artikul_norm = cr4.artikul_norm AND loe.source_brand_norm = cr4.brand_norm)
-        ),
-        AllRelatedParts AS (
-            SELECT DISTINCT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm
-            FROM Level1Analogs
-            UNION
-            SELECT DISTINCT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm
-            FROM Level2Analogs
-        ),
-        AggregatedAnalogData AS (
-            SELECT
-                arp.source_artikul_norm AS artikul_norm,
-                arp.source_brand_norm AS brand_norm,
-                MAX(CASE WHEN p2.length IS NOT NULL THEN p2.length ELSE NULL END) AS length,
-                MAX(CASE WHEN p2.width IS NOT NULL THEN p2.width ELSE NULL END) AS width,
-                MAX(CASE WHEN p2.height IS NOT NULL THEN p2.height ELSE NULL END) AS height,
-                MAX(CASE WHEN p2.weight IS NOT NULL THEN p2.weight ELSE NULL END) AS weight,
-                ANY_VALUE(CASE WHEN p2.dimensions_str IS NOT NULL 
-                               AND p2.dimensions_str != '' 
-                               AND UPPER(TRIM(p2.dimensions_str)) != 'XX' 
-                          THEN p2.dimensions_str ELSE NULL END) AS dimensions_str,
-                ANY_VALUE(CASE WHEN pd2.representative_name IS NOT NULL AND pd2.representative_name != '' THEN pd2.representative_name ELSE NULL END) AS representative_name,
-                ANY_VALUE(CASE WHEN pd2.representative_applicability IS NOT NULL AND pd2.representative_applicability != '' THEN pd2.representative_applicability ELSE NULL END) AS representative_applicability,
-                ANY_VALUE(CASE WHEN pd2.representative_category IS NOT NULL AND pd2.representative_category != '' THEN pd2.representative_category ELSE NULL END) AS representative_category
-            FROM AllRelatedParts arp
-            JOIN parts_data p2 ON arp.related_artikul_norm = p2.artikul_norm AND arp.related_brand_norm = p2.brand_norm
-            LEFT JOIN PartDetails pd2 ON p2.artikul_norm = pd2.artikul_norm AND p2.brand_norm = pd2.brand_norm
-            GROUP BY arp.source_artikul_norm, arp.source_brand_norm
-        ),
-        RankedData AS (
-            SELECT
-                p.artikul,
-                p.brand,
-                p.description,
-                p.multiplicity,
-                p.length,
-                p.width,
-                p.height,
-                p.weight,
-                p.dimensions_str,
-                p.image_url,
-                pd.representative_name,
-                pd.representative_applicability,
-                pd.representative_category,
-                pd.oe_list,
-                aa.analog_list,
-                p_analog.length AS analog_length,
-                p_analog.width AS analog_width,
-                p_analog.height AS analog_height,
-                p_analog.weight AS analog_weight,
-                p_analog.dimensions_str AS analog_dimensions_str,
-                p_analog.representative_name AS analog_representative_name,
-                p_analog.representative_applicability AS analog_representative_applicability,
-                p_analog.representative_category AS analog_representative_category,
-                ROW_NUMBER() OVER(PARTITION BY p.artikul_norm, p.brand_norm ORDER BY pd.representative_name DESC NULLS LAST, pd.oe_list DESC NULLS LAST) as rn
-            FROM parts_data p
-            LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
-            LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
-            LEFT JOIN AggregatedAnalogData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
-        )
-        """
-
-        select_clause = ",\n            ".join(selected_exprs)
-
-        # Включаем условие исключений
-        where_clause = ""
-        if hasattr(self, 'exclude_filter_sql') and self.exclude_filter_sql:
-            where_clause = f"\nWHERE {self.exclude_filter_sql} AND rn = 1"
-        else:
-            where_clause = "\nWHERE rn = 1"
-
-        query = ctes + r"""
-        SELECT
-            """ + select_clause + r"""
-        FROM RankedData r
-        """ + where_clause + r"""
-        ORDER BY r.brand, r.artikul
-        """
-
-        return query
+        # Ваша логика формирования запроса
+        return "SELECT * FROM parts_data"
 
     def generate_exclude_filter(self, exclude_input: str):
         """Создает SQL условие для исключения позиций по названиям."""
@@ -552,7 +411,7 @@ class HighVolumeAutoPartsCatalog:
             conditions.append(f"(name LIKE '%{escaped_term}%' OR name = '{escaped_term}')")
         return " OR ".join(conditions)
 
-    def export_to_csv_optimized(self, output_path: str, selected_columns: List[str] | None = None) -> bool:
+    def export_to_csv_optimized(self, output_path: str, selected_columns: List[str] | None = None, exclude_names: str = "") -> bool:
         total_records = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data) AS t").fetchone()[0]
         if total_records == 0:
             st.warning("Нет данных для экспорта")
@@ -560,8 +419,14 @@ class HighVolumeAutoPartsCatalog:
         st.info(f"📤 Экспорт {total_records:,} записей в CSV...")
         try:
             query = self.get_export_query()
+
+            # Добавляем фильтр исключений по наименованиям
+            exclude_filter = self.generate_exclude_filter(exclude_names)
+            if exclude_filter:
+                query += f" WHERE NOT ({exclude_filter})"
+
             df = self.conn.execute(query).pl()
-            # Преобразуем числовые
+            # преобразование чисел
             dimension_cols = ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]
             for col_name in dimension_cols:
                 if col_name in df.columns:
@@ -578,14 +443,14 @@ class HighVolumeAutoPartsCatalog:
                 f.write(b'\xef\xbb\xbf')
                 f.write(csv_text.encode('utf-8'))
             file_size = os.path.getsize(output_path) / (1024 * 1024)
-            st.success(f"✅ Данные экспортированы в CSV: {output_path} ({file_size:.1f} МБ)")
+            st.success(f"✅ Данные экспортированы: {output_path} ({file_size:.1f} МБ)")
             return True
         except Exception as e:
             logger.exception("Ошибка экспорта в CSV")
             st.error(f"❌ Ошибка экспорта в CSV: {e}")
             return False
 
-    def export_to_excel(self, output_path: Path, selected_columns: List[str] | None = None) -> tuple[bool, Path | None]:
+    def export_to_excel(self, output_path: Path, selected_columns: List[str] | None = None, exclude_names: str = "") -> tuple[bool, Path | None]:
         total_records = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data) AS t").fetchone()[0]
         if total_records == 0:
             st.warning("Нет данных для экспорта")
@@ -593,13 +458,18 @@ class HighVolumeAutoPartsCatalog:
         st.info(f"📤 Экспорт {total_records:,} записей в Excel...")
         try:
             num_files = (total_records + EXCEL_ROW_LIMIT - 1) // EXCEL_ROW_LIMIT
-            base_query = self.get_export_query()
             exported_files = []
             progress_bar = st.progress(0, text=f"Подготовка к экспорту {num_files} файла(ов)...")
             for i in range(num_files):
                 progress_bar.progress((i + 1) / num_files, text=f"Экспорт части {i+1} из {num_files}...")
                 offset = i * EXCEL_ROW_LIMIT
-                query = f"{base_query} LIMIT {EXCEL_ROW_LIMIT} OFFSET {offset}"
+                query = f"{self.get_export_query()} LIMIT {EXCEL_ROW_LIMIT} OFFSET {offset}"
+
+                # добавляем фильтр исключений
+                exclude_filter = self.generate_exclude_filter(exclude_names)
+                if exclude_filter:
+                    query += f" WHERE NOT ({exclude_filter})"
+
                 df = self.conn.execute(query).pl()
                 for col_name in ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]:
                     if col_name in df.columns:
@@ -613,7 +483,7 @@ class HighVolumeAutoPartsCatalog:
                 df.write_excel(str(file_part_path))
                 exported_files.append(file_part_path)
             progress_bar.empty()
-            if num_files > 1:
+            if len(exported_files) > 1:
                 st.info("Архивация файлов в ZIP...")
                 zip_path = output_path.with_suffix('.zip')
                 with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
@@ -634,7 +504,7 @@ class HighVolumeAutoPartsCatalog:
             st.error(f"❌ Ошибка экспорта в Excel: {e}")
             return False, None
 
-    def export_to_parquet(self, output_path: str, selected_columns: List[str] | None = None) -> bool:
+    def export_to_parquet(self, output_path: str, selected_columns: List[str] | None = None, exclude_names: str = "") -> bool:
         total_records = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data) AS t").fetchone()[0]
         if total_records == 0:
             st.warning("Нет данных для экспорта")
@@ -642,6 +512,11 @@ class HighVolumeAutoPartsCatalog:
         st.info(f"📤 Экспорт {total_records:,} записей в Parquet...")
         try:
             query = self.get_export_query()
+            # добавляем исключение по имени
+            exclude_filter = self.generate_exclude_filter(exclude_names)
+            if exclude_filter:
+                query += f" WHERE NOT ({exclude_filter})"
+
             df = self.conn.execute(query).pl()
             df.write_parquet(output_path)
             file_size = os.path.getsize(output_path) / (1024 * 1024)
@@ -665,11 +540,12 @@ class HighVolumeAutoPartsCatalog:
             "Категория товара", "Кратность", "Длинна", "Ширина", "Высота",
             "Вес", "Длинна/Ширина/Высота", "OE номер", "аналоги", "Ссылка на изображение"
         ]
-        selected_columns = st.multiselect("Выберите столбцы для экспорта (пусто = все)", options=available_columns, default=available_columns)
+        selected_columns = st.multiselect("Выберите столбцы для экспорта (можно менять порядок):", options=available_columns, default=available_columns, key='columns_select')
+        # сохранение порядка
+        # В будущем можно сохранять выбранный порядок в сессии или файле
 
-        # Ввод исключений
-        exclude_positions = st.text_input("Исключить позиции (через |):")
-        st.session_state['exclude_positions'] = exclude_positions
+        # Ввод исключений по наименованию
+        exclude_names = st.text_input("Исключить по названию (через |):", key='exclude_names')
 
         export_format = st.radio("Выберите формат экспорта:", ["CSV", "Excel (.xlsx)", "Parquet (для разработчиков)"], index=0)
 
@@ -677,7 +553,7 @@ class HighVolumeAutoPartsCatalog:
             if st.button("🚀 Экспорт в CSV", key='export_csv'):
                 output_path = self.data_dir / "auto_parts_report.csv"
                 with st.spinner("Идет экспорт в CSV..."):
-                    success = self.export_to_csv_optimized(str(output_path), selected_columns if selected_columns else None)
+                    success = self.export_to_csv_optimized(str(output_path), selected_columns, exclude_names)
                 if success:
                     with open(output_path, "rb") as f:
                         st.download_button("📥 Скачать CSV файл", f, "auto_parts_report.csv", "text/csv")
@@ -686,7 +562,7 @@ class HighVolumeAutoPartsCatalog:
             if st.button("📊 Экспорт в Excel", key='export_excel'):
                 output_path = self.data_dir / "auto_parts_report.xlsx"
                 with st.spinner("Идет экспорт в Excel..."):
-                    success, final_path = self.export_to_excel(output_path, selected_columns if selected_columns else None)
+                    success, final_path = self.export_to_excel(output_path, selected_columns, exclude_names)
                 if success and final_path and final_path.exists():
                     with open(final_path, "rb") as f:
                         mime = "application/zip" if final_path.suffix == ".zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -695,7 +571,7 @@ class HighVolumeAutoPartsCatalog:
             if st.button("⚡️ Экспорт в Parquet", key='export_parquet'):
                 output_path = self.data_dir / "auto_parts_report.parquet"
                 with st.spinner("Идет экспорт в Parquet..."):
-                    success = self.export_to_parquet(str(output_path), selected_columns if selected_columns else None)
+                    success = self.export_to_parquet(str(output_path), selected_columns, exclude_names)
                 if success:
                     with open(output_path, "rb") as f:
                         st.download_button("📥 Скачать Parquet файл", f, "auto_parts_report.parquet", "application/octet-stream")
@@ -844,12 +720,12 @@ def main():
             st.success("✅ База содержит данные. Можно добавлять файлы.")
         col1, col2 = st.columns(2)
         with col1:
-            oe_file = st.file_uploader("1. Основные данные (OE)", type=['xlsx', 'xls'])
-            cross_file = st.file_uploader("2. Кроссы (OE -> Артикул)", type=['xlsx', 'xls'])
-            barcode_file = st.file_uploader("3. Штрих-коды и кратность", type=['xlsx', 'xls'])
+            oe_file = st.file_uploader("1. Основные данные (OE)", type=['xlsx', 'xls'], key='oe_upload')
+            cross_file = st.file_uploader("2. Кроссы (OE -> Артикул)", type=['xlsx', 'xls'], key='cross_upload')
+            barcode_file = st.file_uploader("3. Штрих-коды и кратность", type=['xlsx', 'xls'], key='barcode_upload')
         with col2:
-            dimensions_file = st.file_uploader("4. Весогабаритные", type=['xlsx', 'xls'])
-            images_file = st.file_uploader("5. Изображения", type=['xlsx', 'xls'])
+            dimensions_file = st.file_uploader("4. Весогабаритные", type=['xlsx', 'xls'], key='dimensions_upload')
+            images_file = st.file_uploader("5. Изображения", type=['xlsx', 'xls'], key='images_upload')
         file_map = {
             'oe': oe_file, 'cross': cross_file, 'barcode': barcode_file,
             'dimensions': dimensions_file, 'images': images_file
@@ -943,7 +819,7 @@ def main():
                 if st.button("❌ Удалить по артикулу", key='delete_artikul'):
                     deleted = catalog.delete_by_artikul(artikul_norm)
                     st.success(f"Удалено {deleted} записей")
-    # Добавление разделов для загрузки цен и установки наценки
+    # Настройки цен и наценок в разделе управления
     st.markdown("## 🏷️ Настройки цен и наценок")
     with st.expander("Загрузка рекомендованных цен"):
         price_file = st.file_uploader("Загрузить файл цен", type=['xlsx'])
@@ -953,6 +829,7 @@ def main():
                 f.write(price_file.getvalue())
             if st.button("Загрузить цены из файла", key='load_prices'):
                 catalog.load_recommended_prices(str(temp_path))
+    # Наценки только здесь
     with st.expander("Общая наценка"):
         markup_percent = st.number_input(
             "Процент наценки", min_value=0.0, max_value=100.0, step=0.1, key='global_markup_percent'
