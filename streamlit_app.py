@@ -6,7 +6,6 @@ import time
 import io
 import zipfile
 from pathlib import Path
-from typing import Dict, List
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -20,18 +19,14 @@ class AutoPartsCatalog:
         self.db_path = self.data_dir / "catalog.duckdb"
         self.conn = duckdb.connect(str(self.db_path))
         self.setup_database()
-        st.set_page_config(
-            page_title="AutoParts Catalog 10M+",
-            layout="wide",
-            page_icon="🚗"
-        )
-
-        # Наценки
-        self.global_markup_percent = 0.0
-        self.brand_markups: Dict[str, float] = {}
         self.load_recommended_prices()
 
+        self.categories = {}  # категории по ключу
+        self.brand_markups: Dict[str, float] = {}
+        self.global_markup: float = 0.0
+
     def setup_database(self):
+        # Создание таблиц
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe_data (
                 oe_number_norm VARCHAR PRIMARY KEY,
@@ -47,11 +42,12 @@ class AutoPartsCatalog:
                 brand_norm VARCHAR,
                 artikul VARCHAR,
                 brand VARCHAR,
+                category VARCHAR,
                 multiplicity INTEGER,
                 barcode VARCHAR,
-                length DOUBLE, 
+                length DOUBLE,
                 width DOUBLE,
-                height DOUBLE, 
+                height DOUBLE,
                 weight DOUBLE,
                 image_url VARCHAR,
                 dimensions_str VARCHAR,
@@ -77,14 +73,19 @@ class AutoPartsCatalog:
             )
         """)
         self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+                key VARCHAR PRIMARY KEY,
+                name VARCHAR
+            )
+        """)
+        self.conn.execute("""
             CREATE TABLE IF NOT EXISTS markup_settings (
                 id INTEGER PRIMARY KEY,
                 global_markup DOUBLE
             )
         """)
-        # Инициализация
+        # Инициализация глобальной наценки
         self.conn.execute("INSERT OR IGNORE INTO markup_settings (id, global_markup) VALUES (1, 0.0)")
-        self.load_recommended_prices()
 
     def load_recommended_prices(self):
         filepath = self.data_dir / "recommended_prices.xlsx"
@@ -96,7 +97,7 @@ class AutoPartsCatalog:
                     INSERT OR REPLACE INTO prices (artikul, recommended_price, brand)
                     VALUES (?, ?, ?)
                 """, [artikul, price, brand])
-            st.success("Загружены рекомендованные цены из файла.")
+            st.success("Рекомендованные цены загружены.")
         else:
             pass
 
@@ -107,27 +108,28 @@ class AutoPartsCatalog:
                 INSERT OR REPLACE INTO prices (artikul, recommended_price, brand)
                 VALUES (?, ?, ?)
             """, [artikul, price, brand])
-        st.success("Рекомендованные цены сохранены.")
-
-    def set_global_markup(self, percent: float):
-        self.global_markup_percent = percent
-        self.conn.execute("UPDATE markup_settings SET global_markup = ?", [percent])
+        st.success("Цены обновлены.")
 
     def get_global_markup(self):
         res = self.conn.execute("SELECT global_markup FROM markup_settings WHERE id=1").fetchone()
         return res[0] if res else 0.0
 
-    def set_brand_markup(self, brand: str, percent: float):
-        self.brand_markups[brand] = percent
+    def set_global_markup(self, percent: float):
+        self.conn.execute("UPDATE markup_settings SET global_markup=?", [percent])
+        self.global_markup = percent
 
     def get_brand_markup(self, brand: str):
         return self.brand_markups.get(brand, 0.0)
+
+    def set_brand_markup(self, brand: str, percent: float):
+        self.brand_markups[brand] = percent
 
     def create_indexes(self):
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_oe ON oe_data(oe_number_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_parts ON parts_data(artikul_norm, brand_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross ON cross_references(oe_number_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_prices ON prices(artikul)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_categories ON categories(key)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_markup ON markup_settings(id)")
 
     @staticmethod
@@ -137,7 +139,7 @@ class AutoPartsCatalog:
             .fill_null("")
             .cast(pl.Utf8)
             .str.replace_all("'", "")
-            .str.replace_all(r"[^0-9A-Za-zA-za-яЁё`\-\s]", "")
+            .str.replace_all(r"[^0-9A-Za-zА-Яа-яЁё`\-\s]", "")
             .str.replace_all(r"\s+", " ")
             .str.strip_chars()
             .str.to_lowercase()
@@ -150,12 +152,12 @@ class AutoPartsCatalog:
             .fill_null("")
             .cast(pl.Utf8)
             .str.replace_all("'", "")
-            .str.replace_all(r"[^0-9A-Za-zA-za-яЁё`\-\s]", "")
+            .str.replace_all(r"[^0-9A-Za-zА-Яа-яЁё`\-\s]", "")
             .str.replace_all(r"\s+", " ")
             .str.strip_chars()
         )
 
-    def detect_columns(self, actual_cols: List[str], expected_cols: List[str]) -> Dict[str, str]:
+    def detect_columns(self, actual_cols: list, expected_cols: list) -> dict:
         mapping = {}
         col_variants = {
             'oe_number': ['oe номер', 'oe', 'оe', 'номер', 'code', 'OE'],
@@ -219,7 +221,7 @@ class AutoPartsCatalog:
         except:
             return pl.DataFrame()
 
-    def upsert(self, table: str, df: pl.DataFrame, pk: List[str]):
+    def upsert(self, table: str, df: pl.DataFrame, pk: list):
         if df.is_empty():
             return
         df = df.unique(keep='first')
@@ -231,14 +233,14 @@ class AutoPartsCatalog:
         sql = f"""
         INSERT INTO {table} ({', '.join(['"'+c+'"' for c in cols])})
         SELECT * FROM {temp_name}
-        ON CONFLICT ({pk_str}) DO UPDATE SET {set_clause};
+        ON CONFLICT ({pk_str}) DO UPDATE SET {set_clause}
         """
         self.conn.execute(sql)
         self.conn.unregister(temp_name)
 
-    def process_and_load(self, dfs: Dict[str, pl.DataFrame]):
+    def process_and_load(self, dfs: dict):
         st.info("🔄 Обработка и загрузка данных...")
-        # OE
+        # Обработка OE
         if 'oe' in dfs:
             df_oe = dfs['oe'].filter(pl.col('oe_number_norm') != "")
             oe_df = df_oe.select(['oe_number_norm', 'oe_number', 'name', 'applicability']).unique(subset=['oe_number_norm'])
@@ -250,19 +252,19 @@ class AutoPartsCatalog:
             cross_df = df_oe.select(['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
             self.upsert('cross_references', cross_df, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
 
-        # cross
+        # Обработка cross
         if 'cross' in dfs:
             df_cross = dfs['cross'].filter((pl.col('oe_number_norm') != "") & (pl.col('artikul_norm') != ""))
             self.upsert('cross_references', df_cross, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
 
-        # parts
+        # Обработка parts
         all_parts = None
-        for f in ['oe', 'barcode', 'images', 'dimensions']:
-            df = dfs.get(f)
+        for key in ['oe', 'barcode', 'images', 'dimensions']:
+            df = dfs.get(key)
             if df is None or df.is_empty():
                 continue
             if 'artikul_norm' in df.columns:
-                temp = df.select(['artikul', 'artikul_norm', 'brand', 'brand_norm'])
+                temp = df.select(['artikul', 'artikul_norm', 'brand', 'brand_norm', 'category'])
                 if all_parts is None:
                     all_parts = temp
                 else:
@@ -270,17 +272,17 @@ class AutoPartsCatalog:
         if all_parts is None:
             all_parts = pl.DataFrame()
 
-        # загрузка цен
+        # Обработка цен
         prices_df = self.conn.execute("SELECT artikul, recommended_price, brand FROM prices").pl()
         if not all_parts.is_empty():
             all_parts = all_parts.join(prices_df, on='artikul', how='left')
             # размеры
-            for c in ['length','width','height']:
+            for c in ['length', 'width', 'height']:
                 if c not in all_parts.columns:
                     all_parts = all_parts.with_columns(pl.lit(None).cast(pl.Float64).alias(c))
             if 'dimensions_str' not in all_parts.columns:
                 all_parts = all_parts.with_columns(dimensions_str=pl.lit(''))
-            # строки размеров
+            # размеры строк
             all_parts = all_parts.with_columns([
                 pl.col('length').cast(pl.Utf8).fill_null('').alias('_length_str'),
                 pl.col('width').cast(pl.Utf8).fill_null('').alias('_width_str'),
@@ -310,15 +312,15 @@ class AutoPartsCatalog:
                     ' шт.'
                 ], separator='').alias('description')
             )
-            # цена с наценкой
+            # расчет цены с наценкой
             def compute_price(row):
                 base_price = row['recommended_price']
-                if base_price is None or base_price==0:
+                if base_price is None or base_price == 0:
                     return None
                 markup_percent = self.get_global_markup()
-                brand_markup = self.get_brand_markup(row['brand']) if row['brand'] in self.get_brand_markups() else 0.0
+                brand_markup = self.get_brand_markup(row['brand']) if row['brand'] in self.brand_markups else 0.0
                 total_markup = markup_percent + brand_markup
-                return base_price * (1 + total_markup/100)
+                return base_price * (1 + total_markup / 100)
 
             all_parts = all_parts.with_columns(
                 pl.struct([pl.col('brand'), pl.col('recommended_price')])
@@ -328,14 +330,14 @@ class AutoPartsCatalog:
 
             # финальные колонки
             all_parts = all_parts.select([
-                'artikul_norm', 'brand_norm', 'artikul', 'brand', 'multiplicity', 'barcode',
-                'length','width','height','weight','image_url','dimensions_str','description','price_with_markup'
+                'artikul_norm', 'brand_norm', 'artikul', 'brand', 'category', 'multiplicity', 'barcode',
+                'length', 'width', 'height', 'weight', 'image_url', 'dimensions_str', 'description', 'price_with_markup'
             ])
 
             self.upsert('parts_data', all_parts, ['artikul_norm', 'brand_norm'])
 
         self.create_indexes()
-        st.success("Обработка и загрузка завершена.")
+        st.success("Обработка завершена.")
 
     def get_total_parts(self):
         return self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()[0]
@@ -354,23 +356,47 @@ class AutoPartsCatalog:
             'categories': categories
         }
 
-    def build_export_query(self, selected_cols: List[str]=None, exclude_terms: List[str]=None):
-        # Основной запрос
+    def build_export_query(self, selected_cols=None, exclude_terms=None, filters=None):
+        # Создание SQL-запроса для экспорта
         exclude_where = ""
         if exclude_terms:
             clauses = []
             for term in exclude_terms:
                 clauses.append(f"r.\"Наименование\" NOT LIKE '%{term}%'")
             if clauses:
-                exclude_where = "WHERE " + " AND ".join(clauses)
+                exclude_where = " AND ".join(clauses)
+            if exclude_where:
+                exclude_where = "WHERE " + exclude_where
+
+        filter_clauses = []
+        if filters:
+            if 'brand' in filters:
+                brands = filters['brand']
+                brand_list = ", ".join([f"'{b}'" for b in brands])
+                filter_clauses.append(f"p.brand IN ({brand_list})")
+            if 'category' in filters:
+                cats = filters['category']
+                cat_list = ", ".join([f"'{c}'" for c in cats])
+                filter_clauses.append(f"p.category IN ({cat_list})")
+            if 'artikul' in filters:
+                arts = filters['artikul']
+                arts_list = ", ".join([f"'{a}'" for a in arts])
+                filter_clauses.append(f"p.artikul IN ({arts_list})")
+            if 'oe' in filters:
+                o_list = ", ".join([f"'{o}'" for o in filters['oe']])
+                filter_clauses.append(f"pd.oe_list LIKE ANY (ARRAY[{o_list}])")
+        filter_where = ""
+        if filter_clauses:
+            filter_where = " AND ".join(filter_clauses)
+            filter_where = "WHERE " + filter_where
 
         columns_map = [
             ("Артикул бренда", 'p.artikul AS "Артикул бренда"'),
             ("Бренд", 'p.brand AS "Бренд"'),
+            ("Категория", 'p.category AS "Категория"'),
             ("Наименование", 'COALESCE(p.description, "") AS "Наименование"'),
             ("Применимость", 'COALESCE(pd.representative_applicability, "") AS "Применимость"'),
             ("Описание", 'CONCAT(COALESCE(p.description, ""), dt.text) AS "Описание"'),
-            ("Категория товара", 'COALESCE(pd.representative_category, "") AS "Категория товара"'),
             ("Кратность", 'p.multiplicity AS "Кратность"'),
             ("Длинна", 'p.length AS "Длинна"'),
             ("Ширина", 'p.width AS "Ширина"'),
@@ -393,7 +419,6 @@ class AutoPartsCatalog:
             if not selected_exprs:
                 selected_exprs = [expr for _, expr in columns_map]
 
-        # Общий текст
         query = f"""
         WITH DescriptionText AS (
             SELECT CHR(10) || CHR(10) || $${"""Состояние товара: новый (в упаковке).
@@ -434,19 +459,20 @@ class AutoPartsCatalog:
         FROM ranked r
         LEFT JOIN DescriptionText dt ON 1=1
         WHERE r.rn=1
+        {('AND ' + filter_where) if filter_where else ''}
         {('AND ' + exclude_where) if exclude_where else ''}
         ORDER BY r.brand, r.artikul
         """
         return query
 
-    def export_csv(self, output_path: str, selected_cols: List[str]=None, exclude_terms: List[str]=None):
+    def export_csv(self, output_path: str, selected_cols=None, exclude_terms=None, filters=None):
         total = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)").fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
             return False
-        query = self.build_export_query(selected_cols, exclude_terms)
+        query = self.build_export_query(selected_cols, exclude_terms, filters)
         df = self.conn.execute(query).pl()
-        # строки размеров
+        # Форматировать размеры и цену
         for c in ["Длинна", "Ширина", "Высота", "Цена с наценкой"]:
             if c in df.columns:
                 df = df.with_columns(
@@ -464,7 +490,7 @@ class AutoPartsCatalog:
         st.success(f"Экспортировано {total:,} записей. Размер файла: {size_mb:.2f} МБ")
         return True
 
-    def export_excel(self, output_path: Path, selected_cols: List[str]=None, exclude_terms: List[str]=None):
+    def export_excel(self, output_path: Path, selected_cols=None, exclude_terms=None, filters=None):
         total = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)").fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
@@ -472,7 +498,7 @@ class AutoPartsCatalog:
         num_files = (total + EXCEL_ROW_LIMIT - 1) // EXCEL_ROW_LIMIT
         for i in range(num_files):
             offset = i * EXCEL_ROW_LIMIT
-            query = self.build_export_query(selected_cols, exclude_terms) + f" LIMIT {EXCEL_ROW_LIMIT} OFFSET {offset}"
+            query = self.build_export_query(selected_cols, exclude_terms, filters) + f" LIMIT {EXCEL_ROW_LIMIT} OFFSET {offset}"
             df = self.conn.execute(query).pl()
             for c in ["Длинна", "Ширина", "Высота", "Цена с наценкой"]:
                 if c in df.columns:
@@ -495,12 +521,12 @@ class AutoPartsCatalog:
         else:
             return True, output_path
 
-    def export_parquet(self, output_path: str, selected_cols: List[str]=None, exclude_terms: List[str]=None):
+    def export_parquet(self, output_path: str, selected_cols=None, exclude_terms=None, filters=None):
         total = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)").fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
             return False
-        query = self.build_export_query(selected_cols, exclude_terms)
+        query = self.build_export_query(selected_cols, exclude_terms, filters)
         df = self.conn.execute(query).pl()
         df.write_parquet(output_path)
         size_mb = os.path.getsize(output_path) / 1024 / 1024
@@ -508,69 +534,95 @@ class AutoPartsCatalog:
         return True
 
     def show_export_ui(self):
-        st.header("📤 Умный экспорт данных")
-        total = self.conn.execute("SELECT COUNT(DISTINCT artikul_norm, brand_norm) FROM parts_data").fetchone()[0]
+        st.header("📤 Экспорт данных")
+        total = self.conn.execute("SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)").fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта.")
             return
 
-        # Колонки с возможностью drag-and-drop
+        # Фильтры
+        st.subheader("Фильтры")
+        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].drop_nulls().to_list()
+        selected_brands = st.multiselect("Бренды", options=brands)
+        categories = self.conn.execute("SELECT DISTINCT category FROM oe_data").fetchdf()['category'].drop_nulls().to_list()
+        selected_categories = st.multiselect("Категории", options=categories)
+        arts = self.conn.execute("SELECT DISTINCT artikul FROM parts_data").fetchdf()['artikul'].drop_nulls().to_list()
+        selected_arts = st.multiselect("Артикулы", options=arts)
+        o_list = self.conn.execute("SELECT DISTINCT oe_number FROM oe_data").fetchdf()['oe_number'].drop_nulls().to_list()
+        selected_oes = st.multiselect("OE номера", options=o_list)
+
+        filters = {}
+        if selected_brands:
+            filters['brand'] = selected_brands
+        if selected_categories:
+            filters['category'] = selected_categories
+        if selected_arts:
+            filters['artikul'] = selected_arts
+        if selected_oes:
+            filters['oe'] = selected_oes
+
+        # Колонки
         default_cols = [
-            "Артикул бренда", "Бренд", "Наименование", "Применимость", "Описание",
-            "Категория товара", "Кратность", "Длинна", "Ширина", "Высота",
-            "Вес", "Длинна/Ширина/Высота", "OE номер", "аналоги", "Ссылка на изображение", "Цена с наценкой"
+            "Артикул бренда", "Бренд", "Категория", "Наименование", "Применимость", "Описание",
+            "Кратность", "Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота",
+            "OE номер", "аналоги", "Ссылка на изображение", "Цена с наценкой"
         ]
-        selected_cols = st.multiselect("Выберите колонки для экспорта (пусто — все по умолчанию):", options=default_cols, default=default_cols)
+        selected_cols = st.multiselect("Выберите колонки для экспорта", options=default_cols, default=default_cols)
 
-        # фильтр исключений
-        exclude_input = st.text_input("Исключить позиции по названиям (через |):")
-        exclude_terms = [t.strip() for t in exclude_input.split('|')] if exclude_input else []
-
-        format_choice = st.radio("Экспортировать в:", ["CSV", "Excel (.xlsx)", "Parquet"], index=0)
+        format_choice = st.radio("Формат экспорта", ["CSV", "Excel (.xlsx)", "Parquet"])
         if st.button("Экспортировать"):
             if format_choice == "CSV":
-                path = self.data_dir / "auto_parts_export.csv"
-                self.export_csv(str(path), selected_cols, exclude_terms)
-                with open(str(path), "rb") as f:
+                filename = self.data_dir / "auto_parts_export.csv"
+                self.export_csv(str(filename), selected_cols, exclude_terms=None, filters=filters)
+                with open(str(filename), "rb") as f:
                     st.download_button("📥 Скачать CSV", f, "auto_parts_export.csv", "text/csv")
             elif format_choice == "Excel (.xlsx)":
-                path = self.data_dir / "auto_parts_export.xlsx"
-                success, final_path = self.export_excel(path, selected_cols, exclude_terms)
+                filename = self.data_dir / "auto_parts_export.xlsx"
+                success, final_path = self.export_excel(filename, selected_cols, exclude_terms=None, filters=filters)
                 if success and final_path:
                     with open(str(final_path), "rb") as f:
                         mime = "application/zip" if final_path.suffix == ".zip" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                         st.download_button("📥 Скачать файл", f, final_path.name, mime)
             else:
-                path = self.data_dir / "auto_parts_export.parquet"
-                self.export_parquet(str(path), selected_cols, exclude_terms)
-                with open(str(path), "rb") as f:
+                filename = self.data_dir / "auto_parts_export.parquet"
+                self.export_parquet(str(filename), selected_cols, exclude_terms=None, filters=filters)
+                with open(str(filename), "rb") as f:
                     st.download_button("📥 Скачать Parquet", f, "auto_parts_export.parquet", "application/octet-stream")
 
     def show_settings_ui(self):
         st.header("⚙️ Настройки")
         st.subheader("Наценки")
-        # Глобальная
-        new_markup = st.slider("Общая наценка %:", min_value=0.0, max_value=100.0, value=self.get_global_markup(), step=0.5)
-        if st.button("Применить наценку"):
+        # Общая
+        new_markup = st.slider("Общая наценка (%)", 0.0, 100.0, value=self.get_global_markup(), step=0.5)
+        if st.button("Применить общую наценку"):
             self.set_global_markup(new_markup)
             st.success(f"Общая наценка установлена {new_markup}%")
-        # По брендам
+        # Бренды
         st.subheader("Наценки по брендам")
-        # Загрузка текущих
-        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()
-        for b in brands['brand']:
-            current = self.get_brand_markup(b)
-            new_b_markup = st.slider(f"Наценка для бренда '{b}':", min_value=0.0, max_value=100.0, value=current, step=0.5)
+        brands = self.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].drop_nulls().to_list()
+        for b in brands:
+            current_markup = self.get_brand_markup(b)
+            new_b_markup = st.slider(f"Наценка для '{b}'", 0.0, 100.0, value=current_markup, step=0.5)
             if st.button(f"Применить для {b}"):
                 self.set_brand_markup(b, new_b_markup)
                 st.success(f"Наценка для {b} установлена {new_b_markup}%")
         # Загрузка цен
         st.subheader("Загрузка цен из файла")
-        uploaded_files = st.file_uploader("Выберите Excel файл с ценами", type=['xlsx','xls'])
-        if uploaded_files:
-            df_prices = pl.read_excel(uploaded_files)
+        uploaded = st.file_uploader("Загрузить Excel файл с ценами", type=['xlsx','xls'])
+        if uploaded:
+            df_prices = pl.read_excel(uploaded)
             self.save_recommended_prices(df_prices)
-            st.success("Цены обновлены.")
+        # Категории
+        st.subheader("Категории")
+        key_input = st.text_input("Ключ (например, 'engine')")
+        name_input = st.text_input("Название категории")
+        if st.button("Добавить/Обновить категорию"):
+            if key_input and name_input:
+                self.categories[key_input] = name_input
+                st.success(f"Категория '{name_input}' добавлена или обновлена.")
+        st.write("Текущие категории:")
+        for k, v in self.categories.items():
+            st.write(f"{k}: {v}")
 
     def delete_brand(self, brand_norm: str):
         count = self.conn.execute("DELETE FROM parts_data WHERE brand_norm=?", [brand_norm]).fetchone()[0]
@@ -584,14 +636,15 @@ class AutoPartsCatalog:
 
 # Основная функция
 def main():
-    st.title("🚗 AutoParts Catalog - Управление большими данными")
+    st.title("🚗 Полный проект управления автозапчастями")
     st.markdown("""
-    ### 💪 Мощная платформа для работы с автозапчастями
-    - Инкрементальные обновления
-    - Быстрый поиск
-    - Экспорт без дубликатов
-    - Настройка цен и наценок
+    ### 🛠️ Расширенная платформа для работы с большими данными автозапчастей
+    - Гибкое управление ценами, наценками и категориями
+    - Продвинутый экспорт с фильтрацией
+    - Удобное управление артикулами и брендами
+    - Импорт данных и резервное копирование
     """)
+
     catalog = AutoPartsCatalog()
 
     menu = st.sidebar.radio("Навигация", ["Загрузка данных", "Настройки", "Экспорт", "Статистика", "Управление"])
@@ -652,27 +705,38 @@ def main():
         st.dataframe(stats['categories'])
 
     elif menu == "Управление":
-        st.header("🗑️ Управление")
-        action = st.radio("Действие", ["Удалить по бренду", "Удалить по артикулу"])
+        st.header("🗑️ Управление данными")
+        action = st.radio("Действие", ["Удалить по бренду", "Удалить по артикулу", "Редактировать цены"])
         if action == "Удалить по бренду":
-            brands = catalog.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()
-            if not brands.empty:
-                brand = st.selectbox("Выберите бренд для удаления", brands['brand'].to_list())
-                norm = catalog.conn.execute("SELECT brand_norm FROM parts_data WHERE brand=?", [brand]).fetchone()
-                if norm:
-                    norm = norm[0]
-                else:
-                    norm = catalog.normalize_key(pl.Series([brand]))[0]
-                count = catalog.delete_brand(norm)
-                st.success(f"Удалено {count} записей по бренду {brand}")
-            else:
+            brands = catalog.conn.execute("SELECT DISTINCT brand FROM parts_data").fetchdf()['brand'].drop_nulls().to_list()
+            if not brands:
                 st.info("Нет брендов для удаления.")
-        else:
-            artikul = st.text_input("Введите артикул для удаления")
-            if artikul:
-                norm = catalog.normalize_key(pl.Series([artikul]))[0]
-                count = catalog.delete_artikul(norm)
-                st.success(f"Удалено {count} записей по артикулу {artikul}")
+            else:
+                brand = st.selectbox("Выберите бренд для удаления", brands)
+                norm_b = catalog.conn.execute("SELECT brand_norm FROM parts_data WHERE brand=?", [brand]).fetchone()
+                if norm_b:
+                    norm_b = norm_b[0]
+                else:
+                    norm_b = catalog.normalize_key(pl.Series([brand]))[0]
+                count = catalog.delete_brand(norm_b)
+                st.success(f"Удалено {count} записей по бренду {brand}")
+        elif action == "Удалить по артикулу":
+            artikul_input = st.text_input("Введите артикул для удаления")
+            if artikul_input:
+                norm_a = catalog.normalize_key(pl.Series([artikul_input]))[0]
+                count = catalog.delete_artikul(norm_a)
+                st.success(f"Удалено {count} записей по артикулу {artikul_input}")
+        elif action == "Редактировать цены":
+            st.subheader("Редактировать цену")
+            artikul_edit = st.text_input("Артикул")
+            brand_edit = st.text_input("Бренд")
+            price_edit = st.number_input("Цена", min_value=0.0, step=0.01)
+            if st.button("Обновить цену"):
+                catalog.conn.execute(
+                    "INSERT OR REPLACE INTO prices (artikul, recommended_price, brand) VALUES (?, ?, ?)",
+                    [artikul_edit, price_edit, brand_edit]
+                )
+                st.success(f"Цена для {artikul_edit} ({brand_edit}) обновлена.")
 
 if __name__ == "__main__":
     main()
