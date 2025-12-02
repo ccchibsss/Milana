@@ -1,30 +1,28 @@
-import polars as pl
-import duckdb
 import streamlit as st
+import duckdb
+import polars as pl
+import io
 import os
 import time
-import io
 import zipfile
 import json
 from pathlib import Path
 
+# Константы
+DATA_DIR = Path("./auto_parts_data")
+DATA_DIR.mkdir(exist_ok=True)
+DB_PATH = DATA_DIR / "catalog.duckdb"
 EXCEL_ROW_LIMIT = 1_000_000
 
 class AutoPartsCatalog:
     def __init__(self):
-        self.data_dir = Path("./auto_parts_data")
-        self.data_dir.mkdir(exist_ok=True)
-        self.db_path = self.data_dir / "catalog.duckdb"
-        self.conn = duckdb.connect(str(self.db_path))
+        self.conn = duckdb.connect(str(DB_PATH))
         self._setup_database()
         self._create_indexes()
-        st.set_page_config(
-            page_title="AutoParts Catalog 10M+",
-            layout="wide",
-            page_icon="🚗"
-        )
+        self._init_settings()
 
     def _setup_database(self):
+        # Таблицы
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe_data (
                 oe_number_norm VARCHAR PRIMARY KEY,
@@ -84,12 +82,6 @@ class AutoPartsCatalog:
                 brand_markup JSON
             )
         """)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS categories (
-                category_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name VARCHAR
-            )
-        """)
         if not self.conn.execute("SELECT 1 FROM markup_settings").fetchone():
             self.conn.execute("INSERT INTO markup_settings (id, total_markup, brand_markup) VALUES (1, 0, '{}')")
 
@@ -99,8 +91,12 @@ class AutoPartsCatalog:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross ON cross_references(oe_number_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_art ON cross_references(artikul_norm, brand_norm)")
 
+    def _init_settings(self):
+        # Инициализация настроек наценки
+        pass
+
     @staticmethod
-    def normalize_key(series: pl.Series) -> pl.Series:
+    def normalize_key(series):
         return (
             series
             .fill_null("")
@@ -113,7 +109,7 @@ class AutoPartsCatalog:
         )
 
     @staticmethod
-    def clean_values(series: pl.Series) -> pl.Series:
+    def clean_values(series):
         return (
             series
             .fill_null("")
@@ -194,7 +190,8 @@ class AutoPartsCatalog:
         if df.is_empty():
             return
         df_unique = df.unique(keep='first')
-        self.conn.register(f"temp_{table_name}_{int(time.time())}", df_unique.to_arrow())
+        timestamp = int(time.time())
+        self.conn.register(f"temp_{table_name}_{timestamp}", df_unique.to_arrow())
         pk_str = ", ".join([f'"{col}"' for col in pk])
         update_cols = [col for col in df_unique.columns if col not in pk]
         if update_cols:
@@ -203,7 +200,7 @@ class AutoPartsCatalog:
             update_clause = "DO NOTHING"
         sql = f"""
             INSERT INTO {table_name}
-            SELECT * FROM "temp_{table_name}_{int(time.time())}"
+            SELECT * FROM "temp_{table_name}_{timestamp}"
             ON CONFLICT ({pk_str}) {update_clause}
         """
         try:
@@ -211,22 +208,22 @@ class AutoPartsCatalog:
         except Exception as e:
             st.error(f"Ошибка при вставке/обновлении {table_name}: {e}")
         finally:
-            self.conn.unregister(f"temp_{table_name}_{int(time.time())}")
+            self.conn.unregister(f"temp_{table_name}_{timestamp}")
 
-    def process_and_load_data(self, dataframes):
+    def process_and_load(self, dataframes):
         st.info("🔄 Обновление базы данных...")
-        total_steps = 3
+        total_steps = 2
         progress = st.progress(0)
-        step_idx = 0
+        step = 0
 
         # Обработка OE
         if 'oe' in dataframes:
-            step_idx += 1
-            progress.progress(step_idx / total_steps, text=f"Обработка OE ({step_idx}/{total_steps})")
+            step +=1
+            progress.progress(step/total_steps, text=f"Обработка OE ({step}/{total_steps})")
             df_oe = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
             oe_df = df_oe.select(['oe_number_norm', 'oe_number', 'name', 'applicability']).unique(subset=['oe_number_norm'])
             if 'name' in oe_df.columns:
-                oe_df = oe_df.with_columns(self.determine_category_vectorized(pl.col('name')))
+                oe_df = oe_df.with_columns(self._category_by_name(pl.col('name')))
             else:
                 oe_df = oe_df.with_columns(category=pl.lit('Разное'))
             self.upsert_data('oe_data', oe_df, ['oe_number_norm'])
@@ -235,87 +232,67 @@ class AutoPartsCatalog:
 
         # Обработка cross
         if 'cross' in dataframes:
-            step_idx += 1
-            progress.progress(step_idx / total_steps, f"Обработка кроссов ({step_idx}/{total_steps})")
+            step +=1
+            progress.progress(step/total_steps, text=f"Обработка кроссов ({step}/{total_steps})")
             df_cross = dataframes['cross'].filter(
                 (pl.col('oe_number_norm') != "") & (pl.col('artikul_norm') != "")
             )
             self.upsert_data('cross_references', df_cross, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
 
         # Обработка parts
-        step_idx += 1
-        progress.progress(step_idx / total_steps, f"Обработка артикула ({step_idx}/{total_steps})")
-        # Объединение данных
-        # ... (оставьте как есть или адаптируйте по необходимости)
+        step +=1
+        progress.progress(step/total_steps, text=f"Обработка артикула ({step}/{total_steps})")
+        # Можно расширить обработку
+        progress.progress(1)
+        time.sleep(0.5)
+        st.success("🗃️ Обновление завершено!")
 
-        # Обработка категорий
-        # ... (по аналогии с существующим)
-
-        progress.progress(1.0)
-        time.sleep(1)
-        st.success("💾 Обновление базы завершено.")
-
-    def determine_category_vectorized(self, series):
-        categories = {
+    def _category_by_name(self, name_col):
+        categories_map = {
             'аккумулятор': 'Автоэлектрика',
             'фильтр': 'Фильтры',
-            'свеча': 'Автоэлектрика',
             'масло': 'Масла',
-            'тормоз': 'Тормозные системы'
+            'тормоз': 'Тормозные системы',
+            'свеча': 'Автоэлектрика'
         }
-        def category_for_name(name):
-            name_lower = name.lower()
-            for key, cat in categories.items():
-                if key in name_lower:
-                    return cat
+        def get_category(name):
+            n = name.lower()
+            for k, v in categories_map.items():
+                if k in n:
+                    return v
             return 'Разное'
-        return series.apply(category_for_name)
+        return name_col.apply(get_category)
 
-    def merge_all_data_parallel(self, paths: dict):
+    def merge_all_data(self, paths: dict):
         start_time = time.time()
         import concurrent.futures
-        dataframes = {}
+        futures = {}
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {
-                executor.submit(self.read_and_prepare_file, p, t): t
-                for t, p in paths.items()
-            }
-            for f in concurrent.futures.as_completed(futures):
-                t = futures[f]
-                df = f.result()
+            for key, path in paths.items():
+                futures[executor.submit(self.read_and_prepare_file, path, key)] = key
+            dataframes = {}
+            for future in concurrent.futures.as_completed(futures):
+                t = futures[future]
+                df = future.result()
                 if not df.is_empty():
                     dataframes[t] = df
-        if not dataframes:
-            st.warning("Нет данных для обработки.")
-            return
-        self.process_and_load_data(dataframes)
-        st.info(f"Обработка завершена за {time.time() - start_time:.2f} сек.")
-
-    def get_total_records(self):
-        try:
-            return self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()[0]
-        except:
-            return 0
+        if dataframes:
+            self.process_and_load(dataframes)
+        st.success(f"Обработка завершена за {time.time() - start_time:.2f} сек.")
 
     def get_statistics(self):
-        stats = {}
-        try:
-            stats['total_parts'] = self.get_total_records()
-            if stats['total_parts'] == 0:
-                return {
-                    'total_parts': 0, 'total_oe': 0, 'total_brands': 0,
-                    'top_brands': None, 'categories': None
-                }
-            stats['total_oe'] = self.conn.execute("SELECT COUNT(*) FROM oe_data").fetchone()[0]
-            stats['total_brands'] = self.conn.execute("SELECT COUNT(DISTINCT brand) FROM parts_data WHERE brand IS NOT NULL").fetchone()[0]
-            brs = self.conn.execute("SELECT brand, COUNT(*) FROM parts_data WHERE brand IS NOT NULL GROUP BY brand ORDER BY COUNT(*) DESC LIMIT 10").fetchall()
-            stats['top_brands'] = pl.DataFrame(brs, schema=["brand", "count"])
-            cats = self.conn.execute("SELECT category, COUNT(*) FROM oe_data WHERE category IS NOT NULL GROUP BY category ORDER BY COUNT(*) DESC").fetchall()
-            stats['categories'] = pl.DataFrame(cats, schema=["category", "count"])
-        except Exception as e:
-            st.error(f"Ошибка статистики: {e}")
-            stats = {}
-        return stats
+        total_parts = self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()[0]
+        total_oe = self.conn.execute("SELECT COUNT(*) FROM oe_data").fetchone()[0]
+        total_brands = self.conn.execute("SELECT COUNT(DISTINCT brand) FROM parts_data WHERE brand IS NOT NULL").fetchone()[0]
+        top_brands = self.conn.execute("SELECT brand, COUNT(*) as cnt FROM parts_data WHERE brand IS NOT NULL GROUP BY brand ORDER BY cnt DESC LIMIT 10").fetchdf()
+        categories = self.conn.execute("SELECT category, COUNT(*) as cnt FROM oe_data WHERE category IS NOT NULL GROUP BY category ORDER BY cnt DESC").fetchdf()
+        return {
+            'total_parts': total_parts,
+            'total_oe': total_oe,
+            'total_brands': total_brands,
+            'top_brands': top_brands,
+            'categories': categories
+        }
 
     def load_recommended_prices(self, file_bytes):
         df = pl.read_excel(io.BytesIO(file_bytes))
@@ -329,13 +306,13 @@ class AutoPartsCatalog:
         for row in df.iter_rows():
             artikul, price = row
             norm_series = self.normalize_key(pl.Series([artikul]))
-            artikul_norm = norm_series[0] if len(norm_series) > 0 else ''
+            artikul_norm = norm_series[0]
             self.conn.execute("""
                 INSERT INTO recommended_prices (artikul_norm, price)
                 VALUES (?, ?)
                 ON CONFLICT (artikul_norm) DO UPDATE SET price=excluded.price
             """, [artikul_norm, price])
-        st.success("Рекомендованные цены загружены.")
+        st.success("Рекомендованные цены обновлены!")
 
     def load_price_list(self, file_bytes):
         df = pl.read_excel(io.BytesIO(file_bytes))
@@ -358,14 +335,14 @@ class AutoPartsCatalog:
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT (artikul, brand) DO UPDATE SET quantity=excluded.quantity, price=excluded.price
             """, [artikul, brand, qty, price])
-        st.success("Прайс-лист загружен.")
+        st.success("Прайс-лист загружен!")
 
-    def set_markups(self, total_markup, brand_markups):
+    def set_markups(self, total_markup, brand_markup):
         self.conn.execute("""
             UPDATE markup_settings SET total_markup=?, brand_markup=?
             WHERE id=1
-        """, [total_markup, json.dumps(brand_markups)])
-        st.success("Настройки наценки обновлены.")
+        """, [total_markup, json.dumps(brand_markup)])
+        st.success("Настройки наценки сохранены!")
 
     def get_markups(self):
         row = self.conn.execute("SELECT total_markup, brand_markup FROM markup_settings WHERE id=1").fetchone()
@@ -374,14 +351,6 @@ class AutoPartsCatalog:
             brand_markup = json.loads(brand_markup_json) if brand_markup_json else {}
             return total_markup, brand_markup
         return 0, {}
-
-    def apply_markup(self, price, brand_norm=''):
-        total, brand = self.get_markups()
-        markup = total
-        brand_markup = self.get_marked_brands()
-        if brand_norm and brand_norm in brand_markup:
-            markup += brand_markup[brand_norm]
-        return price * (1 + markup / 100)
 
     def get_marked_brands(self):
         _, brand_markup = self.get_markups()
@@ -414,7 +383,7 @@ class AutoPartsCatalog:
             GROUP BY cr.artikul_norm, cr.brand_norm
         ),
         RankedData AS (
-            -- логика ранжирования
+            -- Можно реализовать ранжирование по необходимости
         )
         """
         # Колонки по умолчанию
@@ -484,9 +453,9 @@ class AutoPartsCatalog:
         return query
 
     def export_csv(self, output_path, selected_columns=None, exclude_names=None):
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)"
-        ).fetchone()[0]
+        total = self.conn.execute("""
+            SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)
+        """).fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
             return False
@@ -500,14 +469,6 @@ class AutoPartsCatalog:
             df = df.with_columns(
                 pl.col('Цена с наценкой').apply(lambda p: self.apply_markup(p)).alias('Цена с наценкой')
             )
-        for c in ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]:
-            if c in df.columns:
-                df = df.with_columns(
-                    pl.when(pl.col(c).is_not_null())
-                    .then(pl.col(c).cast(pl.Utf8))
-                    .otherwise("")
-                    .alias(c)
-                )
         buf = io.StringIO()
         df.write_csv(buf, separator=';')
         with open(output_path, 'wb') as f:
@@ -517,9 +478,9 @@ class AutoPartsCatalog:
         return True
 
     def export_excel(self, output_path, selected_columns=None, exclude_names=None):
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)"
-        ).fetchone()[0]
+        total = self.conn.execute("""
+            SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)
+        """).fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
             return False, None
@@ -559,9 +520,9 @@ class AutoPartsCatalog:
         return True, final_path
 
     def export_parquet(self, output_path, selected_columns=None, exclude_names=None):
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)"
-        ).fetchone()[0]
+        total = self.conn.execute("""
+            SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)
+        """).fetchone()[0]
         if total == 0:
             st.warning("Нет данных для экспорта")
             return False
@@ -582,7 +543,6 @@ class AutoPartsCatalog:
     def apply_markup(self, price):
         total, brand = self.get_markups()
         markup = total
-        brand_markup = self.get_marked_brands()
         return price * (1 + markup / 100)
 
     def get_markups(self):
@@ -595,11 +555,11 @@ class AutoPartsCatalog:
 
     def show_export_interface(self):
         st.header("📤 Экспорт данных")
-        total = self.conn.execute(
-            "SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)"
-        ).fetchone()[0]
+        total = self.conn.execute("""
+            SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)
+        """).fetchone()[0]
         if total == 0:
-            st.warning("Нет данных для экспорта.")
+            st.warning("Нет данных для экспорта")
             return
         options = [
             "Артикул бренда", "Бренд", "Наименование", "Применимость", "Описание",
@@ -641,82 +601,20 @@ class AutoPartsCatalog:
                 with open(out_file, "rb") as f:
                     st.download_button("📥 Скачать Parquet", f, "auto_parts_report.parquet", "application/octet-stream")
 
-    def load_recommended_prices(self, file_bytes):
-        df = pl.read_excel(io.BytesIO(file_bytes))
-        if 'артикул' not in df.columns or 'цена' not in df.columns:
-            st.error("Файл должен содержать 'артикул' и 'цена'")
-            return
-        df = df.select([
-            pl.col('артикул').alias('artikul'),
-            pl.col('цена').cast(pl.Float64)
-        ])
-        for row in df.iter_rows():
-            artikul, price = row
-            norm_series = self.normalize_key(pl.Series([artikul]))
-            artikul_norm = norm_series[0] if len(norm_series) > 0 else ''
-            self.conn.execute("""
-                INSERT INTO recommended_prices (artikul_norm, price)
-                VALUES (?, ?)
-                ON CONFLICT (artikul_norm) DO UPDATE SET price=excluded.price
-            """, [artikul_norm, price])
-        st.success("Рекомендованные цены загружены.")
-
-    def load_price_list(self, file_bytes):
-        df = pl.read_excel(io.BytesIO(file_bytes))
-        required_cols = ['артикул', 'бренд', 'кол-во', 'цена']
-        if not all(c in df.columns for c in required_cols):
-            st.error("Проверьте наличие колонок 'артикул', 'бренд', 'кол-во', 'цена'")
-            return
-        df = df.select([
-            pl.col('артикул'),
-            pl.col('бренд'),
-            pl.col('кол-во').cast(pl.Int32),
-            pl.col('цена').cast(pl.Float64)
-        ])
-        for row in df.iter_rows():
-            artikul, brand, qty, price = row
-            norm_artikul = self.normalize_key(pl.Series([artikul]))[0]
-            norm_brand = self.normalize_key(pl.Series([brand]))[0]
-            self.conn.execute("""
-                INSERT INTO price_list (artikul, brand, quantity, price)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT (artikul, brand) DO UPDATE SET quantity=excluded.quantity, price=excluded.price
-            """, [artikul, brand, qty, price])
-        st.success("Прайс-лист загружен.")
-
-    def set_markups(self, total_markup, brand_markups):
-        self.conn.execute("""
-            UPDATE markup_settings SET total_markup=?, brand_markup=?
-            WHERE id=1
-        """, [total_markup, json.dumps(brand_markups)])
-        st.success("Настройки наценки обновлены.")
-
-    def get_markups(self):
-        row = self.conn.execute("SELECT total_markup, brand_markup FROM markup_settings WHERE id=1").fetchone()
-        if row:
-            total_markup, brand_markup_json = row
-            brand_markup = json.loads(brand_markup_json) if brand_markup_json else {}
-            return total_markup, brand_markup
-        return 0, {}
-
-    def get_marked_brands(self):
-        _, brand_markup = self.get_markups()
-        return json.loads(brand_markup) if brand_markup else {}
-
-# --- Основной интерфейс ---
+# Основной интерфейс
 def main():
-    st.title("🚗 AutoParts Catalog - 10+ млн записей")
-    st.markdown("Мощная система для управления большими данными автозапчастей.")
+    st.set_page_config(page_title="AutoParts Catalog", layout="wide")
+    st.title("🚗 AutoParts Catalog — Управление и экспорт")
     catalog = AutoPartsCatalog()
 
-    menu = st.sidebar.radio("Меню", ["Загрузка данных", "Экспорт", "Статистика", "Управление", "Рекомендации цен", "Прайс-лист"])
+    menu = st.sidebar.radio("Меню", ["Загрузка данных", "Экспорт", "Статистика", "Рекомендации цен", "Прайс-лист"])
 
     if menu == "Загрузка данных":
         st.subheader("Загрузка файлов")
         col1, col2 = st.columns(2)
         with col1:
             file_oe = st.file_uploader("Основные данные (OE)", type=['xlsx', 'xls'])
-            file_cross = st.file_uploader("Кроссы (OE -> Артикул)", type=['xlsx', 'xls'])
+            file_cross = st.file_uploader("Кроссы (OE → Артикул)", type=['xlsx', 'xls'])
             file_barcode = st.file_uploader("Штрих-коды", type=['xlsx', 'xls'])
         with col2:
             file_dim = st.file_uploader("Весогабариты", type=['xlsx', 'xls'])
@@ -728,62 +626,42 @@ def main():
             'dimensions': file_dim,
             'images': file_img
         }
-        if st.button("🚀 Начать обработку"):
+        if st.button("🚀 Обработать файлы"):
             paths = {}
-            for ftype, uploaded in files_map.items():
+            for key, uploaded in files_map.items():
                 if uploaded:
-                    filename = f"{ftype}_{int(time.time())}_{uploaded.name}"
-                    path = catalog.data_dir / filename
+                    filename = f"{key}_{int(time.time())}_{uploaded.name}"
+                    path = DATA_DIR / filename
                     with open(path, "wb") as f:
-                        f.write(uploaded.getvalue())
-                    paths[ftype] = str(path)
+                        f.write(uploaded.read())
+                    paths[key] = str(path)
             if paths:
-                catalog.merge_all_data_parallel(paths)
+                catalog.merge_all_data(paths)
             else:
-                st.info("Загрузите хотя бы один файл.")
+                st.info("Загрузите файлы для обработки.")
     elif menu == "Экспорт":
         catalog.show_export_interface()
     elif menu == "Статистика":
-        st.header("📈 Статистика")
         stats = catalog.get_statistics()
-        st.metric("Артикулов", stats.get('total_parts', 0))
-        st.metric("OE", stats.get('total_oe', 0))
-        st.metric("Брендов", stats.get('total_brands', 0))
+        st.metric("Артикулов", stats['total_parts'])
+        st.metric("OE", stats['total_oe'])
+        st.metric("Брендов", stats['total_brands'])
         st.subheader("Топ брендов")
-        st.dataframe(stats.get('top_brands', None))
+        st.dataframe(stats['top_brands'])
         st.subheader("Распределение по категориям")
-        st.bar_chart(stats.get('categories', None))
-    elif menu == "Управление":
-        st.header("🗑️ Управление")
-        op = st.radio("Действие", ["Удалить по бренду", "Удалить по артикулу"])
-        if op == "Удалить по бренду":
-            brands = catalog.conn.execute("SELECT DISTINCT brand, brand_norm FROM parts_data WHERE brand IS NOT NULL").fetchall()
-            if brands:
-                b_list = [b for b, bn in brands]
-                selected_b = st.selectbox("Выберите бренд", b_list)
-                bn_row = catalog.conn.execute("SELECT brand_norm FROM parts_data WHERE brand=?", [selected_b]).fetchone()
-                bn = bn_row[0] if bn_row else ''
-                count_del = catalog.delete_by_brand(bn)
-                st.success(f"Удалено {count_del} записей для бренда {selected_b}")
-            else:
-                st.info("Нет брендов для удаления.")
-        else:
-            arti = st.text_input("Артикул для удаления")
-            if arti:
-                norm_series = catalog.normalize_key(pl.Series([arti]))
-                arti_norm = norm_series[0] if len(norm_series) > 0 else ''
-                count_del = catalog.delete_by_artikul(arti_norm)
-                st.success(f"Удалено {count_del} записей по артикулу {arti}")
+        st.dataframe(stats['categories'])
+        st.bar_chart(stats['categories'].set_index('category')['cnt'])
     elif menu == "Рекомендации цен":
-        st.header("🔖 Загрузка рекомендуемых цен")
-        uploaded = st.file_uploader("Загрузите файл с рекомендациями", type=['xlsx', 'xls'])
+        st.subheader("Загрузка рекомендаций по ценам")
+        uploaded = st.file_uploader("Загрузите файл с ценами", type=['xlsx', 'xls'])
         if uploaded:
             catalog.load_recommended_prices(uploaded.read())
     elif menu == "Прайс-лист":
-        st.header("🧾 Загрузка прайс-листа")
+        st.subheader("Загрузка прайс-листа")
         uploaded = st.file_uploader("Загрузите прайс-лист", type=['xlsx', 'xls'])
         if uploaded:
             catalog.load_price_list(uploaded.read())
+
 
 if __name__ == "__main__":
     main()
