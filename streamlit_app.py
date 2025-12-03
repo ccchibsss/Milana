@@ -11,14 +11,12 @@ from pathlib import Path
 DATA_DIR = Path("./auto_parts_data")
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = DATA_DIR / "catalog.duckdb"
-EXCEL_ROW_LIMIT = 1_000_000
 
 class AutoPartsCatalog:
     def __init__(self):
         self.conn = duckdb.connect(str(DB_PATH))
         self._setup_database()
         self._create_indexes()
-        self._init_settings()
 
     def _setup_database(self):
         # Таблицы
@@ -83,7 +81,6 @@ class AutoPartsCatalog:
         """)
         if not self.conn.execute("SELECT 1 FROM markup_settings").fetchone():
             self.conn.execute("INSERT INTO markup_settings (id, total_markup, brand_markup) VALUES (1, 0, '{}')")
-
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 name VARCHAR PRIMARY KEY,
@@ -96,9 +93,6 @@ class AutoPartsCatalog:
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_parts ON parts_data(artikul_norm, brand_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross ON cross_references(oe_number_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross_art ON cross_references(artikul_norm, brand_norm)")
-
-    def _init_settings(self):
-        pass
 
     @staticmethod
     def normalize_key(series):
@@ -224,6 +218,7 @@ class AutoPartsCatalog:
             progress.progress(step/total_steps, text=f"Обработка OE ({step}/{total_steps})")
             df_oe = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
             oe_df = df_oe.select(['oe_number_norm', 'oe_number', 'name', 'applicability']).unique(subset=['oe_number_norm'])
+            # добавляем категорию
             if 'name' in oe_df.columns:
                 oe_df = oe_df.with_columns(self._category_by_name(pl.col('name')))
             else:
@@ -268,7 +263,6 @@ class AutoPartsCatalog:
         return name_col.apply(get_category)
 
     def build_export_query(self, selected_columns=None, category_filter=None):
-        # category_filter - список категорий для фильтрации, если None - все
         desc_text = """Состояние товара: новый (в упаковке).
 Высококачественные автозапчасти и автотовары — надежное решение для вашего автомобиля. 
 Обеспечьте безопасность, долговечность и высокую производительность вашего авто с помощью нашего широкого ассортимента оригинальных и совместимых автозапчастей.
@@ -388,7 +382,7 @@ class AutoPartsCatalog:
         st.success("Прайс-лист загружен!")
 
     def get_filtered_exclusions(self, exclude_terms):
-        """Возвращает список строк, которые нужно исключить по точному и частичному совпадению"""
+        """Возвращает список строк, которые нужно исключить по названиям"""
         exclude_list = [term.strip() for term in exclude_terms.split('|') if term.strip()]
         return exclude_list
 
@@ -402,13 +396,12 @@ class AutoPartsCatalog:
             mask = mask | df['name'].str.contains(term, case=False)
         return df.filter(~mask)
 
-    def export_data(self, columns=None, exclude_terms=None, category_filter=None, category_filter_mode='include'):
+    def export_data(self, columns=None, exclude_terms=None, category_filter=None):
         """
         Экспорт данных с возможностью исключений и выбора колонок.
         columns - список выбранных колонок в желаемом порядке.
         exclude_terms - строки для исключения (через |), могут быть точные или частичные совпадения.
         category_filter - список категорий для фильтрации.
-        category_filter_mode - 'include' или 'exclude'
         """
         query = self.build_export_query(selected_columns=columns, category_filter=category_filter)
         df = self._run_query(query)
@@ -456,55 +449,72 @@ class AutoPartsCatalog:
 
         # Исключение по названиям
         exclude_input = st.text_input("Исключить позиции по названию (через |)", "")
+
         # Категории фильтрации
         categories = self.conn.execute("SELECT DISTINCT category FROM parts_data").fetchdf()['category'].tolist()
         categories.insert(0, 'Все')
         category_filter = st.multiselect("Фильтр по категориям", categories, default=['Все'])
         if 'Все' in category_filter:
             category_filter = None
+        elif not category_filter:
+            category_filter = None
         else:
             category_filter = category_filter
 
-        # Выбор режима фильтрации категорий
-        category_filter_mode = 'include'  # можно расширить для исключения
-
-        # Общая наценка
-        total_markup = st.number_input("Общая наценка (%)", value=0.0, step=0.1)
-        # Наценки по брендам
+        # Наценки
+        total_markup_value = st.number_input("Общая наценка (%)", value=0.0, step=0.1)
         brand_markup_json = self.conn.execute("SELECT brand, COUNT(*) as cnt FROM parts_data GROUP BY brand").fetchdf()
         brand_markup_dict = {}
         st.write("Настройки наценок по брендам:")
         for index, row in brand_markup_json.iterrows():
             brand = row['brand']
             default_markup = 0.0
-            brand_markup_value = st.number_input(f"Наценка для {brand}", value=default_markup, step=0.1, key=f"markup_{brand}")
-            brand_markup_dict[brand] = brand_markup_value
-        # Сохранение настроек
-        if st.button("Сохранить настройки наценок"):
-            self.set_markups(total_markup, brand_markup_dict)
+            markup_value = st.number_input(f"{brand}", value=default_markup, step=0.1, key=f"markup_{brand}")
+            brand_markup_dict[brand] = markup_value
 
-        # Формат экспорта
+        if st.button("Сохранить настройки наценки"):
+            self.set_markups(total_markup_value, brand_markup_dict)
+
         if st.button("Экспортировать данные"):
             df = self.export_data(
                 columns=selected_cols,
                 exclude_terms=exclude_input,
-                category_filter=None if category_filter is None else category_filter
+                category_filter=None if category_filter is None or 'Все' in category_filter else category_filter
             )
             if df is not None:
-                # Применение наценки к ценам
-                total_markup_value, brand_markup_dict = self.get_markups()
+                total_markup, brand_markup = self.get_markups()
                 if 'price_with_markup' in df.columns:
                     df = df.with_columns(
                         pl.col('price_with_markup').apply(
-                            lambda p: self.apply_markup(p, total_markup_value, brand_markup_dict, None)
+                            lambda p: self.apply_markup(p, total_markup, brand_markup, None)
                         ).alias('price_with_markup')
                     )
-                # Сохранение в Excel
                 buffer = io.BytesIO()
                 df.write_excel(buffer)
                 buffer.seek(0)
                 filename = f"export_{int(time.time())}.xlsx"
                 st.download_button("Скачать файл", data=buffer, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    def apply_markup(self, price, total_markup, brand_markup_dict, brand):
+        markup = total_markup
+        if brand and brand in brand_markup_dict:
+            markup += brand_markup_dict[brand]
+        return price * (1 + markup / 100)
+
+    def get_markups(self):
+        row = self.conn.execute("SELECT total_markup, brand_markup FROM markup_settings WHERE id=1").fetchone()
+        if row:
+            total_markup, brand_markup_json = row
+            brand_markup = json.loads(brand_markup_json) if brand_markup_json else {}
+            return total_markup, brand_markup
+        return 0, {}
+
+    def set_markups(self, total_markup, brand_markup):
+        self.conn.execute("""
+            UPDATE markup_settings SET total_markup=?, brand_markup=?
+            WHERE id=1
+        """, [total_markup, json.dumps(brand_markup)])
+        st.success("Настройки наценки сохранены!")
 
 # Основной интерфейс
 def main():
@@ -515,7 +525,7 @@ def main():
     menu = st.sidebar.radio("Меню", ["Загрузка данных", "Экспорт", "Статистика", "Рекомендации цен", "Прайс-лист"])
 
     if menu == "Загрузка данных":
-        st.subheader("Загрузка файлов")
+        st.subheader("Загрузите файлы для обработки")
         col1, col2 = st.columns(2)
         with col1:
             file_oe = st.file_uploader("Основные данные (OE)", type=['xlsx', 'xls'])
@@ -524,6 +534,7 @@ def main():
         with col2:
             file_dim = st.file_uploader("Весогабариты", type=['xlsx', 'xls'])
             file_img = st.file_uploader("Изображения", type=['xlsx', 'xls'])
+
         files_map = {
             'oe': file_oe,
             'cross': file_cross,
@@ -531,21 +542,25 @@ def main():
             'dimensions': file_dim,
             'images': file_img
         }
+
         if st.button("🚀 Обработать файлы"):
-            paths = {}
+            dataframes = {}
             for key, uploaded in files_map.items():
                 if uploaded:
                     filename = f"{key}_{int(time.time())}_{uploaded.name}"
                     path = DATA_DIR / filename
                     with open(path, "wb") as f:
                         f.write(uploaded.read())
-                    paths[key] = str(path)
-            if paths:
-                catalog.process_and_load(paths)
+                    df = catalog.read_and_prepare_file(str(path), key)
+                    dataframes[key] = df
+            if dataframes:
+                catalog.process_and_load(dataframes)
             else:
                 st.info("Загрузите файлы для обработки.")
+
     elif menu == "Экспорт":
         catalog.show_export_interface()
+
     elif menu == "Статистика":
         stats = catalog.get_statistics()
         st.metric("Артикулов", stats['total_parts'])
@@ -556,11 +571,13 @@ def main():
         st.subheader("Распределение по категориям")
         st.dataframe(stats['categories'])
         st.bar_chart(stats['categories'].set_index('category')['cnt'])
+
     elif menu == "Рекомендации цен":
         st.subheader("Загрузка рекомендаций по ценам")
         uploaded = st.file_uploader("Загрузите файл с ценами", type=['xlsx', 'xls'])
         if uploaded:
             catalog.load_recommended_prices(uploaded.read())
+
     elif menu == "Прайс-лист":
         st.subheader("Загрузка прайс-листа")
         uploaded = st.file_uploader("Загрузите прайс-лист", type=['xlsx', 'xls'])
