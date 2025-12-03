@@ -19,7 +19,7 @@ class AutoPartsCatalog:
         self._create_indexes()
 
     def _setup_database(self):
-        # Таблицы
+        # Создание таблиц
         self.conn.execute("""
             CREATE TABLE IF NOT EXISTS oe_data (
                 oe_number_norm VARCHAR PRIMARY KEY,
@@ -89,6 +89,7 @@ class AutoPartsCatalog:
         """)
 
     def _create_indexes(self):
+        # Индексы
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_oe ON oe_data(oe_number_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_parts ON parts_data(artikul_norm, brand_norm)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS idx_cross ON cross_references(oe_number_norm)")
@@ -129,23 +130,20 @@ class AutoPartsCatalog:
         st.subheader("Текущие категории")
         edited_df = st.experimental_data_editor(df, use_container_width=True)
         if st.button("Обновить категории"):
-            # Обновление названий и удаление
             original_names = df['name'].tolist()
             updated_names = edited_df['name'].tolist()
             for old_name, new_name in zip(original_names, edited_df['name']):
                 if old_name != new_name:
                     self.update_category_name(old_name, new_name)
-            # Удаление отсутствующих
             for name in original_names:
                 if name not in edited_df['name'].tolist():
                     self.delete_category(name)
             st.success("Категории обновлены!")
 
-    # --- Загрузка и обработка файлов ---
+    # --- Загрузка файлов ---
     def read_and_prepare_file(self, filepath, key):
         try:
             df = pl.read_excel(filepath)
-            # Предобработка зависит от типа файла
             if key == 'oe':
                 df = df.rename({"№ OE": "oe_number", "Наименование": "name", "Применимость": "applicability", "Категория": "category"})
                 df['oe_number_norm'] = df['oe_number'].str.strip().str.upper()
@@ -168,7 +166,7 @@ class AutoPartsCatalog:
             return None
 
     def process_and_load(self, dataframes):
-        # Обработка и загрузка в базу
+        # Обработка данных
         if 'oe' in dataframes:
             df_oe = dataframes['oe']
             for row in df_oe.iter_rows():
@@ -184,7 +182,6 @@ class AutoPartsCatalog:
                     VALUES (?, ?, ?)
                 """, [row['oe_number'].strip().upper(), row['artikul'].strip().upper(), row['brand'].strip().upper()])
         if 'barcode' in dataframes:
-            # обработка штрихкодов
             pass
         if 'dimensions' in dataframes:
             df_dim = dataframes['dimensions']
@@ -193,7 +190,6 @@ class AutoPartsCatalog:
                     UPDATE OR INSERT INTO parts_data (artikul_norm, brand_norm, length, width, height, weight)
                     VALUES (?, ?, ?, ?, ?, ?)
                 """, [row['artikul'].strip().upper(), row['brand'].strip().upper(), row['length'], row['width'], row['height'], row['weight']])
-        # добавьте остальные обработки по необходимости
 
     def load_recommended_prices(self, file_bytes):
         try:
@@ -260,12 +256,19 @@ class AutoPartsCatalog:
 
     # --- Экспорт ---
     def show_export_interface(self):
-        st.subheader("Экспорт данных")
-        all_cols = [
-            'artikul', 'brand', 'category', 'length', 'width', 'height', 'weight',
-            'image_url', 'description', 'oe_list', 'price_with_markup'
+        st.subheader("📤 Умный экспорт данных")
+        total_records = self.conn.execute("SELECT count(DISTINCT (artikul_norm, brand_norm)) FROM parts_data").fetchone()[0]
+        st.info(f"Всего записей для экспорта (строк): {total_records:,}")
+        if total_records == 0:
+            st.warning("База данных пуста или нет связей для экспорта. Сначала загрузите данные.")
+            return
+
+        available_columns = [
+            "Артикул бренда", "Бренд", "Наименование", "Применимость", "Описание",
+            "Категория товара", "Кратность", "Длинна", "Ширина", "Высота",
+            "Вес", "Длинна/Ширина/Высота", "OE номер", "аналоги", "Ссылка на изображение"
         ]
-        selected_cols = st.multiselect("Выберите колонки для экспорта (в желаемом порядке)", all_cols, default=all_cols)
+        selected_columns = st.multiselect("Выберите столбцы для экспорта (пусто = все)", options=available_columns, default=available_columns)
         exclude_input = st.text_input("Исключить позиции по названию (через |)", "")
 
         categories = self.get_categories()['name'].tolist()
@@ -284,7 +287,7 @@ class AutoPartsCatalog:
         st.write("Настройки наценок по брендам:")
         for index, row in brand_markup_df.iterrows():
             brand = row['brand']
-            default_markup = 0.0
+            default_markup = 0
             markup_value = st.number_input(f"{brand}", value=default_markup, step=0.1, key=f"markup_{brand}")
             brand_markup_dict[brand] = markup_value
 
@@ -293,7 +296,7 @@ class AutoPartsCatalog:
 
         if st.button("Экспортировать данные"):
             df = self.export_data(
-                columns=selected_cols,
+                columns=selected_columns,
                 exclude_terms=exclude_input,
                 category_filter=None if 'Все' in category_filter else category_filter
             )
@@ -312,7 +315,7 @@ class AutoPartsCatalog:
                 st.download_button("Скачать файл", data=buffer, file_name=filename, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     def export_data(self, columns=None, exclude_terms='', category_filter=None):
-        # Построение SQL-запрос для экспорта с выбранными колонками и фильтрами
+        # Построение SQL-запрос
         all_columns = {
             'artikul': 'p.artikul',
             'brand': 'p.brand',
@@ -326,59 +329,10 @@ class AutoPartsCatalog:
             'oe_list': 'pd.oe_list',
             'price_with_markup': 'p.price_with_markup'
         }
+
         select_cols = [all_columns.get(c, c) for c in columns] if columns else list(all_columns.values())
 
-        query = """
-        WITH PartDetails AS (
-            SELECT cr.artikul_norm, cr.brand_norm,
-            STRING_AGG(DISTINCT regexp_replace(regexp_replace(o.oe_number, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\\-\\s]', '', 'g'), ', ') AS oe_list,
-            ANY_VALUE(o.name) AS representative_name,
-            ANY_VALUE(o.applicability) AS representative_applicability,
-            ANY_VALUE(o.category) AS representative_category
-            FROM cross_references cr
-            JOIN oe_data o ON cr.oe_number_norm = o.oe_number_norm
-            GROUP BY cr.artikul_norm, cr.brand_norm
-        ),
-        AllAnalogs AS (
-            SELECT cr1.artikul_norm, cr1.brand_norm,
-            STRING_AGG(DISTINCT regexp_replace(regexp_replace(p2.artikul, '''', ''), '[^0-9A-Za-zА-Яа-яЁё`\\-\\s]', '', 'g'), ', ') as analog_list
-            FROM cross_references cr1
-            JOIN cross_references cr2 ON cr1.oe_number_norm = cr2.oe_number_norm
-            JOIN parts_data p2 ON cr2.artikul_norm = p2.artikul_norm AND cr2.brand_norm = p2.brand_norm
-            WHERE (cr1.artikul_norm != p2.artikul_norm OR cr1.brand_norm != p2.brand_norm)
-            GROUP BY cr1.artikul_norm, cr1.brand_norm
-        ),
-        RankedData AS (
-            SELECT p.*, pd.*, aa.*,
-            ROW_NUMBER() OVER(PARTITION BY p.artikul_norm, p.brand_norm ORDER BY pd.representative_name DESC NULLS LAST, pd.oe_list DESC NULLS LAST) as rn
-            FROM parts_data p
-            LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
-            LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
-        )
-        SELECT """ + ", ".join(select_cols) + """
-        FROM RankedData r
-        LEFT JOIN PartDetails pd ON r.artikul_norm=pd.artikul_norm AND r.brand_norm=pd.brand_norm
-        WHERE r.rn=1
-        """
-
-        # Фильтр по категории
-        if category_filter:
-            category_conditions = " OR ".join([f"p.category = '{c}'" for c in category_filter])
-            query += f" AND ({category_conditions})"
-
-        # Исключения по терминам
-        if exclude_terms:
-            exclude_list = exclude_terms.split('|')
-            for term in exclude_list:
-                query += f" AND r.description NOT LIKE '%{term}%'"
-
-        return query
-
-    def build_export_query(self, selected_columns):
-        return self._build_full_export_sql(selected_columns)
-
-    def _build_full_export_sql(self, selected_columns):
-        # Вставьте сюда полный SQL из вашего первого кода
+        # Весь SQL из вашего первого кода
         standard_description = """Состояние товара: новый (в упаковке).
 Высококачественные автозапчасти и автотовары — надежное решение для вашего автомобиля. 
 Обеспечьте безопасность, долговечность и высокую производительность вашего авто с помощью нашего широкого ассортимента оригинальных и совместимых автозапчастей.
@@ -388,8 +342,7 @@ class AutoPartsCatalog:
 Мы гарантируем быструю доставку, выгодные цены и профессиональную консультацию для любого клиента — автолюбителя, специалиста или автосервиса. 
 
 Выбирайте только лучшее — надежность и качество от ведущих производителей."""
-        # Весь SQL-запрос из вашего первого кода:
-        sql = f"""
+        sql_full = f"""
         WITH DescriptionTemplate AS (
             SELECT CHR(10) || CHR(10) || $${standard_description}$$ AS text
         ),
@@ -467,7 +420,7 @@ class AutoPartsCatalog:
             SELECT DISTINCT source_artikul_norm, source_brand_norm, related_artikul_norm, related_brand_norm
             FROM Level2Analogs
         ),
-        AggregatedAnalogData AS (
+        AggregatedData AS (
             SELECT
                 arp.source_artikul_norm AS artikul_norm,
                 arp.source_brand_norm AS brand_norm,
@@ -475,10 +428,7 @@ class AutoPartsCatalog:
                 MAX(CASE WHEN p2.width IS NOT NULL THEN p2.width ELSE NULL END) AS width,
                 MAX(CASE WHEN p2.height IS NOT NULL THEN p2.height ELSE NULL END) AS height,
                 MAX(CASE WHEN p2.weight IS NOT NULL THEN p2.weight ELSE NULL END) AS weight,
-                ANY_VALUE(CASE WHEN p2.dimensions_str IS NOT NULL 
-                               AND p2.dimensions_str != '' 
-                               AND UPPER(TRIM(p2.dimensions_str)) != 'XX' 
-                          THEN p2.dimensions_str ELSE NULL END) AS dimensions_str,
+                ANY_VALUE(CASE WHEN p2.dimensions_str IS NOT NULL AND p2.dimensions_str != '' AND UPPER(TRIM(p2.dimensions_str)) != 'XX' THEN p2.dimensions_str ELSE NULL END) AS dimensions_str,
                 ANY_VALUE(CASE WHEN pd2.representative_name IS NOT NULL AND pd2.representative_name != '' THEN pd2.representative_name ELSE NULL END) AS representative_name,
                 ANY_VALUE(CASE WHEN pd2.representative_applicability IS NOT NULL AND pd2.representative_applicability != '' THEN pd2.representative_applicability ELSE NULL END) AS representative_applicability,
                 ANY_VALUE(CASE WHEN pd2.representative_category IS NOT NULL AND pd2.representative_category != '' THEN pd2.representative_category ELSE NULL END) AS representative_category
@@ -516,15 +466,15 @@ class AutoPartsCatalog:
             FROM parts_data p
             LEFT JOIN PartDetails pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
             LEFT JOIN AllAnalogs aa ON p.artikul_norm = aa.artikul_norm AND p.brand_norm = aa.brand_norm
-            LEFT JOIN AggregatedAnalogData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
+            LEFT JOIN AggregatedData p_analog ON p.artikul_norm = p_analog.artikul_norm AND p.brand_norm = p_analog.brand_norm
         )
         """
 
-        select_clause = ",\n            ".join(selected_cols)
+        select_clause = ",\n            ".join(select_cols)
 
-        # Вставьте сюда весь блок SQL
+        # Итоговый запрос
         query = f"""
-        {sql}
+        {sql_full}
         SELECT
             {select_clause}
         FROM RankedData r
@@ -573,7 +523,7 @@ def main():
                         f.write(uploaded.read())
                     df = catalog.read_and_prepare_file(str(path), key)
                     dataframes[key] = df
-            # Загрузка файла с категориями
+            # Категории
             if 'categories' in files_map and files_map['categories']:
                 catalog.load_categories(files_map['categories'].read())
 
