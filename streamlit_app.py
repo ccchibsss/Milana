@@ -4,8 +4,6 @@ import streamlit as st
 import os
 import time
 import logging
-import io
-import zipfile
 from pathlib import Path
 from typing import Dict, List
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -75,6 +73,7 @@ class HighVolumeAutoPartsCatalog:
                 PRIMARY KEY (artikul_norm, brand_norm)
             )
         """)
+        self.create_indexes()
 
     def create_indexes(self):
         st.info("Создание индексов для ускорения поиска...")
@@ -495,7 +494,6 @@ class HighVolumeAutoPartsCatalog:
         if st.button("Экспортировать"):
             query = self.get_export_query(selected_columns, exclusions)
             df_export = self.conn.execute(query).pl()
-            # Логика для экспорта данных
             output_path = self.data_dir / "exported_data.csv"
             df_export.write_csv(str(output_path))
             st.success(f"Данные успешно экспортированы: {output_path.name}")
