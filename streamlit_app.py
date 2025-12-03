@@ -718,17 +718,16 @@ class HighVolumeAutoPartsCatalog:
     def apply_markup(self, brand: str, percentage: float) -> bool:
         """Apply a specific markup percentage to a brand's prices."""
         try:
-            # Check if this brand already has a setting
+            # Проверка наличия настроек для указанного бренда
             exists_result = self.conn.execute("SELECT COUNT(*) FROM markup_settings WHERE brand = ?", [brand]).fetchone()
             if exists_result[0] > 0:
-                # Update existing record
+                # Обновляем существующий процент наценки
                 self.conn.execute("UPDATE markup_settings SET markup_percentage = ? WHERE brand = ?", [percentage, brand])
             else:
-                # Insert new record
+                # Создаем новую запись настройки
                 self.conn.execute("INSERT INTO markup_settings (brand, markup_percentage) VALUES (?, ?)", [brand, percentage])
             
-            # Now apply the markup to corresponding prices
-            # First, fetch current prices for this brand
+            # Применяем наценку к ценам соответствующего бренда
             prices_result = self.conn.execute("SELECT artikul_norm, brand_norm, recommended_price FROM prices WHERE brand_norm = ?", [brand]).fetchall()
             updated_prices = []
             for row in prices_result:
@@ -736,7 +735,7 @@ class HighVolumeAutoPartsCatalog:
                 new_price = round(old_price * (1 + percentage / 100), 2)
                 updated_prices.append((new_price, artikul_norm, brand_norm))
             
-            # Bulk update prices
+            # Массовый апдейт цен
             if updated_prices:
                 self.conn.executemany("UPDATE prices SET recommended_price = ? WHERE artikul_norm = ? AND brand_norm = ?", updated_prices)
             
