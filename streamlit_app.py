@@ -6,6 +6,7 @@ import os
 import time
 import json
 from pathlib import Path
+from difflib import get_close_matches
 
 # Константы
 DATA_DIR = Path("./auto_parts_data")
@@ -218,11 +219,11 @@ class AutoPartsCatalog:
             progress.progress(step / total_steps, text=f"Обработка OE ({step}/{total_steps})")
             df_oe = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
             oe_df = df_oe.select(['oe_number_norm', 'oe_number', 'name', 'applicability']).unique(subset=['oe_number_norm'])
-            # добавляем категорию
-            if 'name' in oe_df.columns:
-                oe_df = oe_df.with_columns(self._category_by_name(pl.col('name')).alias('category'))
-            else:
-                oe_df = oe_df.with_columns(pl.lit('Разное').alias('category'))
+            # добавляем категорию (здесь убрали, так как просили)
+            # if 'name' in oe_df.columns:
+            #     oe_df = oe_df.with_columns(self._category_by_name(pl.col('name')).alias('category'))
+            # else:
+            #     oe_df = oe_df.with_columns(pl.lit('Разное').alias('category'))
             self.upsert_data('oe_data', oe_df, ['oe_number_norm'])
             cross_df = df_oe.filter(pl.col('artikul_norm') != "").select(['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
             self.upsert_data('cross_references', cross_df, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
@@ -244,23 +245,36 @@ class AutoPartsCatalog:
         time.sleep(0.5)
         st.success("🗃️ Обновление завершено!")
 
-    def _category_by_name(self, name_series):
-        categories_map = {
-            'аккумулятор': 'Автоэлектрика',
-            'фильтр': 'Фильтры',
-            'масло': 'Масла',
-            'тормоз': 'Тормозные системы',
-            'свеча': 'Автоэлектрика'
-        }
-        def get_category(name):
-            if name is None:
-                return 'Разное'
-            n = name.lower()
-            for k, v in categories_map.items():
-                if k in n:
-                    return v
-            return 'Разное'
-        return name_series.apply(get_category)
+    def load_category_data(self, file_bytes):
+        """Загрузка файла с наименованиями и категориями"""
+        df = pl.read_excel(io.BytesIO(file_bytes))
+        # Предполагается, что файл содержит наименование и категорию
+        if 'наименование' not in df.columns or 'категория' not in df.columns:
+            st.error("Файл должен содержать 'наименование' и 'категория'")
+            return
+        df = df.select([
+            pl.col('наименование'),
+            pl.col('категория')
+        ])
+        # Загрузка данных в память
+        self._category_data = df
+
+    def assign_categories(self, df_names):
+        """Поиск приблизительных совпадений и присвоение категории"""
+        if not hasattr(self, '_category_data'):
+            return pl.Series([''] * len(df_names))
+        category_series = []
+        categories = self._category_data['наименование'].to_list()
+        categories_lower = [cat.lower() for cat in categories]
+        for name in df_names:
+            name_lower = name.lower() if name else ''
+            matches = get_close_matches(name_lower, categories_lower, n=1, cutoff=0.6)
+            if matches:
+                idx = categories_lower.index(matches[0])
+                category_series.append(self._category_data['категория'][idx])
+            else:
+                category_series.append('')
+        return pl.Series(category_series)
 
     def build_export_query(self, selected_columns=None, category_filter=None):
         desc_text = """Состояние товара: новый (в упаковке).
@@ -315,12 +329,6 @@ class AutoPartsCatalog:
             select_cols = '*'
         ctes += f" {select_cols} FROM PartDetails p WHERE p.rn=1"
         return ctes
-
-    def apply_markup(self, price, total_markup, brand_markup_dict, brand):
-        markup = total_markup
-        if brand and brand in brand_markup_dict:
-            markup += brand_markup_dict[brand]
-        return price * (1 + markup / 100)
 
     def get_markups(self):
         row = self.conn.execute("SELECT total_markup, brand_markup FROM markup_settings WHERE id=1").fetchone()
@@ -529,13 +537,15 @@ def main():
         with col2:
             file_dim = st.file_uploader("Весогабариты", type=['xlsx', 'xls'])
             file_img = st.file_uploader("Изображения", type=['xlsx', 'xls'])
+            file_category = st.file_uploader("Категории (наименование, категория)", type=['xlsx', 'xls'])
 
         files_map = {
             'oe': file_oe,
             'cross': file_cross,
             'barcode': file_barcode,
             'dimensions': file_dim,
-            'images': file_img
+            'images': file_img,
+            'categories': file_category
         }
 
         if st.button("🚀 Обработать файлы"):
@@ -548,8 +558,26 @@ def main():
                         f.write(uploaded.read())
                     df = catalog.read_and_prepare_file(str(path), key)
                     dataframes[key] = df
+            # Загрузка файла с категориями
+            if 'categories' in files_map and files_map['categories']:
+                catalog.load_category_data(files_map['categories'].read())
+
             if dataframes:
                 catalog.process_and_load(dataframes)
+                # После загрузки, присвоение категорий по названию
+                if hasattr(catalog, '_category_data'):
+                    # Обновляем категории по совпадениям
+                    # Для всех строк в parts_data
+                    df_parts = catalog.conn.execute("SELECT artikul_norm, brand_norm, artikul, brand FROM parts_data").fetchdf()
+                    if not df_parts.empty:
+                        categories_assigned = catalog.assign_categories(pl.Series(df_parts['artikul']))
+                        # Обновляем категории в parts_data
+                        for idx, row in df_parts.iterrows():
+                            category_name = categories_assigned[idx]
+                            catalog.conn.execute("""
+                                UPDATE parts_data SET category=? WHERE artikul_norm=? AND brand_norm=?
+                            """, [category_name, row['artikul_norm'], row['brand_norm']])
+                        st.success("Категории по наименованиям успешно присвоены!")
             else:
                 st.info("Загрузите файлы для обработки.")
 
