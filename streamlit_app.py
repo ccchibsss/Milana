@@ -214,37 +214,37 @@ class AutoPartsCatalog:
 
         # Обработка OE
         if 'oe' in dataframes:
-            step +=1
-            progress.progress(step/total_steps, text=f"Обработка OE ({step}/{total_steps})")
+            step += 1
+            progress.progress(step / total_steps, text=f"Обработка OE ({step}/{total_steps})")
             df_oe = dataframes['oe'].filter(pl.col('oe_number_norm') != "")
             oe_df = df_oe.select(['oe_number_norm', 'oe_number', 'name', 'applicability']).unique(subset=['oe_number_norm'])
             # добавляем категорию
             if 'name' in oe_df.columns:
-                oe_df = oe_df.with_columns(self._category_by_name(pl.col('name')))
+                oe_df = oe_df.with_columns(self._category_by_name(pl.col('name')).alias('category'))
             else:
-                oe_df = oe_df.with_columns(category=pl.lit('Разное'))
+                oe_df = oe_df.with_columns(pl.lit('Разное').alias('category'))
             self.upsert_data('oe_data', oe_df, ['oe_number_norm'])
             cross_df = df_oe.filter(pl.col('artikul_norm') != "").select(['oe_number_norm', 'artikul_norm', 'brand_norm']).unique()
             self.upsert_data('cross_references', cross_df, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
 
         # Обработка cross
         if 'cross' in dataframes:
-            step +=1
-            progress.progress(step/total_steps, text=f"Обработка кроссов ({step}/{total_steps})")
+            step += 1
+            progress.progress(step / total_steps, text=f"Обработка кроссов ({step}/{total_steps})")
             df_cross = dataframes['cross'].filter(
                 (pl.col('oe_number_norm') != "") & (pl.col('artikul_norm') != "")
             )
             self.upsert_data('cross_references', df_cross, ['oe_number_norm', 'artikul_norm', 'brand_norm'])
 
         # Обработка parts
-        step +=1
-        progress.progress(step/total_steps, text=f"Обработка артикула ({step}/{total_steps})")
+        step += 1
+        progress.progress(step / total_steps, text=f"Обработка артикула ({step}/{total_steps})")
         # Можно расширить обработку
         progress.progress(1)
         time.sleep(0.5)
         st.success("🗃️ Обновление завершено!")
 
-    def _category_by_name(self, name_col):
+    def _category_by_name(self, name_series):
         categories_map = {
             'аккумулятор': 'Автоэлектрика',
             'фильтр': 'Фильтры',
@@ -260,7 +260,7 @@ class AutoPartsCatalog:
                 if k in n:
                     return v
             return 'Разное'
-        return name_col.apply(get_category)
+        return name_series.apply(get_category)
 
     def build_export_query(self, selected_columns=None, category_filter=None):
         desc_text = """Состояние товара: новый (в упаковке).
@@ -308,7 +308,6 @@ class AutoPartsCatalog:
             GROUP BY cr.artikul_norm, cr.brand_norm
         )
         SELECT
-            -- Выборка колонок по умолчанию или по выбранным
         """
         if selected_columns:
             select_cols = ', '.join(selected_columns)
@@ -439,7 +438,6 @@ class AutoPartsCatalog:
 
     def show_export_interface(self):
         st.subheader("Экспорт данных")
-        # Выбор колонок
         all_cols = [
             'artikul', 'brand', 'category', 'length', 'width', 'height', 'weight',
             'image_url', 'description', 'oe_list', 'price_with_markup'
@@ -447,10 +445,8 @@ class AutoPartsCatalog:
         selected_cols = st.multiselect("Выберите колонки для экспорта (в желаемом порядке)", all_cols, default=all_cols)
         selected_cols = list(selected_cols)
 
-        # Исключение по названиям
         exclude_input = st.text_input("Исключить позиции по названию (через |)", "")
 
-        # Категории фильтрации
         categories = self.conn.execute("SELECT DISTINCT category FROM parts_data").fetchdf()['category'].tolist()
         categories.insert(0, 'Все')
         category_filter = st.multiselect("Фильтр по категориям", categories, default=['Все'])
@@ -461,12 +457,11 @@ class AutoPartsCatalog:
         else:
             category_filter = category_filter
 
-        # Наценки
         total_markup_value = st.number_input("Общая наценка (%)", value=0.0, step=0.1)
-        brand_markup_json = self.conn.execute("SELECT brand, COUNT(*) as cnt FROM parts_data GROUP BY brand").fetchdf()
+        brand_markup_df = self.conn.execute("SELECT brand, COUNT(*) as cnt FROM parts_data GROUP BY brand").fetchdf()
         brand_markup_dict = {}
         st.write("Настройки наценок по брендам:")
-        for index, row in brand_markup_json.iterrows():
+        for index, row in brand_markup_df.iterrows():
             brand = row['brand']
             default_markup = 0.0
             markup_value = st.number_input(f"{brand}", value=default_markup, step=0.1, key=f"markup_{brand}")
