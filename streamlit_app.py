@@ -20,8 +20,10 @@ class AutoPartsCatalog:
         self.db_path = self.data_dir / "catalog.duckdb"
         self.conn = duckdb.connect(str(self.db_path))
         self.setup_database()
-        self.global_markup = 0.0
-        self.brand_markup: dict = {}
+        self.global_markup = 0.0  # Глобальная наценка
+        self.brand_markup: dict = {}  # Наценка для брендов
+        self.excluded_brands: list = []  # Исключенные бренды
+        self.excluded_artikuls: list = []  # Исключенные артикула
         self.create_indexes()
 
     def setup_database(self):
@@ -363,6 +365,19 @@ class AutoPartsCatalog:
             paths[key] = str(filename)
         self.merge_all_data_parallel(paths)
 
+    # --- управление настройками ---
+    def set_global_markup(self, value):
+        self.global_markup = value
+
+    def set_brand_markup(self, brand, value):
+        self.brand_markup[brand] = value
+
+    def set_excluded_brands(self, brands_list):
+        self.excluded_brands = brands_list
+
+    def set_excluded_artikuls(self, artikuls_list):
+        self.excluded_artikuls = artikuls_list
+
     # --- экспорт ---
     def show_export_interface(self):
         st.header("📤 Экспорт данных")
@@ -390,21 +405,6 @@ class AutoPartsCatalog:
             if filename:
                 with open(filename, "rb") as f:
                     st.download_button("Скачать файл", f, filename, mime="application/octet-stream")
-
-    def export_to_csv_optimized(self, filename, selected_cols):
-        total = self.get_total_records()
-        if total == 0:
-            st.warning("Нет данных для экспорта")
-            return
-        query = self.build_export_query(selected_cols)
-        df = self.conn.execute(query).pl()
-        buf = io.StringIO()
-        df.write_csv(buf, separator=';')
-        csv_bytes = buf.getvalue().encode('utf-8')
-        with open(filename, 'wb') as f:
-            f.write(b'\xef\xbb\xbf')  # BOM
-            f.write(csv_bytes)
-        return filename
 
     def build_export_query(self, selected_cols):
         # Полный SQL-запрос с CTE
@@ -473,6 +473,21 @@ LEFT JOIN pr ON p.artikul_norm = pr.artikul_norm AND p.brand_norm = pr.brand_nor
 """
         return sql
 
+    def export_to_csv_optimized(self, filename, selected_cols):
+        total = self.get_total_records()
+        if total == 0:
+            st.warning("Нет данных для экспорта")
+            return
+        query = self.build_export_query(selected_cols)
+        df = self.conn.execute(query).pl()
+        buf = io.StringIO()
+        df.write_csv(buf, separator=';')
+        csv_bytes = buf.getvalue().encode('utf-8')
+        with open(filename, 'wb') as f:
+            f.write(b'\xef\xbb\xbf')  # BOM
+            f.write(csv_bytes)
+        return filename
+
     def export_to_excel(self, filename, selected_cols):
         total = self.get_total_records()
         if total == 0:
@@ -487,12 +502,12 @@ LEFT JOIN pr ON p.artikul_norm = pr.artikul_norm AND p.brand_norm = pr.brand_nor
             df = self.conn.execute(query).pl()
             part_filename = self.data_dir / f"{Path(filename).stem}_part{i+1}.xlsx"
             df.write_excel(str(part_filename))
-            files.append(part_filename)
+            files.append(str(part_filename))
         if len(files) > 1:
             zip_path = self.data_dir / (Path(filename).stem + ".zip")
             with zipfile.ZipFile(zip_path, 'w') as zf:
                 for f in files:
-                    zf.write(f, arcname=f.name)
+                    zf.write(f, arcname=os.path.basename(f))
                     os.remove(f)
             return str(zip_path)
         else:
@@ -503,6 +518,36 @@ LEFT JOIN pr ON p.artikul_norm = pr.artikul_norm AND p.brand_norm = pr.brand_nor
         df = self.conn.execute(query).pl()
         df.write_parquet(filename)
         return filename
+
+    # --- установка настроек ---
+    def set_global_markup(self, value):
+        self.global_markup = value
+
+    def set_brand_markup(self, brand, value):
+        self.brand_markup[brand] = value
+
+    def set_excluded_brands(self, brands_list):
+        self.excluded_brands = brands_list
+
+    def set_excluded_artikuls(self, artikuls_list):
+        self.excluded_artikuls = artikuls_list
+
+    # --- фильтры ---
+    def apply_filters(self, df):
+        # Исключение брендов и артикула
+        if self.excluded_brands:
+            df = df.filter(~pl.col('brand').is_in(self.excluded_brands))
+        if self.excluded_artikuls:
+            df = df.filter(~pl.col('artikul').is_in(self.excluded_artikuls))
+        return df
+
+    def get_filtered_parts(self):
+        query = "SELECT * FROM parts_data"
+        df = self.conn.execute(query).pl()
+        return self.apply_filters(df)
+
+    def determine_category_vectorized(self, col):
+        return pl.lit('Категория')
 
 
 def main():
@@ -549,12 +594,37 @@ def main():
     elif choice == "Экспорт":
         catalog.show_export_interface()
 
+        # дополнительно: установка наценки и исключений
+        st.sidebar.header("Настройки экспорта")
+        with st.sidebar.expander("Настройки цен и исключений"):
+            global_markup_input = st.number_input("Глобальная наценка (%)", min_value=0.0, max_value=100.0, value=catalog.global_markup)
+            catalog.set_global_markup(global_markup_input)
+            brand_markup_input = st.text_input("Наценки по брендам (через запятую, бренд=процент)", "")
+            if brand_markup_input:
+                for item in brand_markup_input.split(','):
+                    if '=' in item:
+                        brand, percent = item.split('=')
+                        try:
+                            catalog.set_brand_markup(brand.strip(), float(percent.strip()))
+                        except:
+                            continue
+            exclude_brands_input = st.text_input("Исключить бренды (через запятую)", "")
+            if exclude_brands_input:
+                catalog.set_excluded_brands([b.strip() for b in exclude_brands_input.split(',')])
+            exclude_artikul_input = st.text_input("Исключить артикулы (через запятую)", "")
+            if exclude_artikul_input:
+                catalog.set_excluded_artikuls([a.strip() for a in exclude_artikul_input.split(',')])
+
     elif choice == "Статистика":
         stats = catalog.get_statistics()
         st.subheader("Статистика")
         st.write(f"Общее количество артикулов: {stats.get('total_parts',0):,}")
         st.write(f"Общее количество OE: {stats.get('total_oe',0):,}")
         st.write(f"Общее количество брендов: {stats.get('total_brands',0):,}")
+        st.subheader("Топ брендов")
+        st.dataframe(stats.get('top_brands', pl.DataFrame()))
+        st.subheader("Категории")
+        st.dataframe(stats.get('categories', pl.DataFrame()))
 
     elif choice == "Управление":
         st.header("🗑️ Удаление данных")
@@ -581,6 +651,7 @@ def main():
                     catalog.conn.execute("DELETE FROM parts_data WHERE artikul_norm = ?", [normalized])
                     catalog.conn.execute("DELETE FROM cross_references WHERE (artikul_norm, brand_norm) NOT IN (SELECT artikul_norm, brand_norm FROM parts_data)")
                     st.success("Удалено.")
+
 
 if __name__ == "__main__":
     main()
