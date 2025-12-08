@@ -45,7 +45,8 @@ class HighVolumeAutoPartsCatalog:
             layout="wide",
             page_icon="🚗"
         )
-            def load_cloud_config(self) -> Dict[str, Any]:
+
+    def load_cloud_config(self) -> Dict[str, Any]:
         """Загрузка конфигурации облачного хранилища"""
         config_path = self.data_dir / "cloud_config.json"
         default_config = {
