@@ -1614,29 +1614,29 @@ def show_export_interface(self):
         apply_markup = st.checkbox("Применить наценку", value=True, disabled=not include_prices)
 
     # Кнопка экспорта
-    if st.button("🚀 Выполнить экспорт", type="primary"):
-        output_path = self.data_dir / f"auto_parts_export.{export_format.lower().replace(' ', '_')}"
-        with st.spinner("Формирование отчета..."):
-            if export_format == "CSV":
-                success = self.export_to_csv_optimized(
-                    str(output_path),
-                    selected_columns if selected_columns else None,
-                    include_prices,
-                    apply_markup
-                )
-            # Здесь можно добавить поддержку экспорта в Excel и Parquet
-            else:
-                st.warning(f"Формат {export_format} пока не поддерживается. Выберите CSV.")
-                success = False
+if st.button("🚀 Выполнить экспорт", type="primary"):
+    output_path = self.data_dir / f"auto_parts_export.{export_format.lower().replace(' ', '_')}"
+    with st.spinner("Формирование отчета..."):
+        if export_format == "CSV":
+            success = self.export_to_csv_optimized(
+                str(output_path),
+                selected_columns if selected_columns else None,
+                include_prices,
+                apply_markup
+            )
+        # Здесь можно добавить поддержку экспорта в Excel и Parquet
+        else:
+            st.warning(f"Формат {export_format} пока не поддерживается. Выберите CSV.")
+            success = False
 
-            if success:
-                with open(output_path, "rb") as f:
-                    st.download_button(
-                        "⬇️ Скачать файл",
-                        f,
-                        file_name=output_path.name,
-                        mime="application/octet-stream"
-                    )
+        if success:
+            with open(output_path, "rb") as f:
+                st.download_button(
+                    "⬇️ Скачать файл",
+                    f,
+                    file_name=output_path.name,
+                    mime="application/octet-stream"
+                )
 
 def export_to_excel_optimized(self, output_path: str, selected_columns: Optional[List[str]] = None, include_prices: bool = True, apply_markup: bool = True) -> bool:
     """Экспорт в Excel (.xlsx) с разбивкой на листы при превышении лимита строк"""
@@ -1650,178 +1650,174 @@ def export_to_excel_optimized(self, output_path: str, selected_columns: Optional
 
     st.info(f"📊 Подготовка экспорта в Excel: {total_records:,} записей...")
 
-try:
-    import pandas as pd
-    query = self.build_export_query(selected_columns, include_prices, apply_markup)
-    df = pd.read_sql(query, self.conn)
-    
-    # Далее ваш код по сохранению df в Excel
-except Exception as e:
-    st.error(f"Ошибка при подготовке данных: {e}")
-    
+    try:
+        import pandas as pd
+        query = self.build_export_query(selected_columns, include_prices, apply_markup)
+        df = pd.read_sql(query, self.conn)
+        
+        # Далее ваш код по сохранению df в Excel
         # Преобразуем размерные колонки в строки
-dimension_cols = ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]
-expressions = []
+        dimension_cols = ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]
+        expressions = []
 
-for col in dimension_cols:
-    if col in df.columns:
-        expressions.append(
-            pl.when(pl.col(col).is_not_null())
-              .then(pl.col(col).cast(pl.Utf8))
-              .otherwise("")
-              .alias(col)
-        )
-
-if expressions:
-    df = df.with_columns(expressions)
-    
-            # Конвертация в pandas (требуется для openpyxl)
-    pdf = df.to_pandas()
-
-            # Проверка на лимит Excel
-    if len(pdf) <= EXCEL_ROW_LIMIT:
-                # Простой экспорт в один лист
-                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                    pdf.to_excel(writer, index=False, sheet_name='Данные')
-    else:
-                # Разбивка на несколько листов
-                num_sheets = (len(pdf) // EXCEL_ROW_LIMIT) + 1
-                st.warning(f"Записей больше {EXCEL_ROW_LIMIT}, будет создано {num_sheets} листов")
-
-                with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
-                    for i in range(num_sheets):
-                        start_idx = i * EXCEL_ROW_LIMIT
-                        end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(pdf))
-                        chunk = pdf.iloc[start_idx:end_idx]
-                        sheet_name = f"Данные_{i + 1}"
-                        chunk.to_excel(writer, index=False, sheet_name=sheet_name)
-
-     file_size = os.path.getsize(output_path) / (1024 * 1024)
-            st.success(f"✅ Данные экспортированы в Excel: {output_path} ({file_size:.1f} МБ)")
-            return True
-
-        except Exception as e:
-            logger.exception("Ошибка экспорта в Excel")
-            st.error(f"❌ Ошибка экспорта в Excel: {e}")
-            return False
-
-    def export_to_parquet(self, output_path: str, selected_columns: Optional[List[str]] = None, include_prices: bool = True, apply_markup: bool = True) -> bool:
-        """Экспорт в Parquet — оптимально для больших данных и аналитики"""
-        st.info("📦 Подготовка экспорта в Parquet...")
-
-        try:
-            query = self.build_export_query(selected_columns, include_prices, apply_markup)
-            df = self.conn.execute(query).pl()  # Используем Polars для оптимального сохранения в Parquet
-
-            # Сохраняем напрямую через Polars
-            df.write_parquet(output_path)
-
-            file_size = os.path.getsize(output_path) / (1024 * 1024)
-            st.success(f"✅ Данные экспортированы в Parquet: {output_path} ({file_size:.1f} МБ)")
-            return True
-
-        except Exception as e:
-            logger.exception("Ошибка экспорта в Parquet")
-            st.error(f"❌ Ошибка экспорта в Parquet: {e}")
-            return False
-
-    def show_statistics(self):
-        """Отображение статистики по базе данных"""
-        st.header("📈 Статистика по базе данных")
-
-        stats = {}
-        try:
-            stats['parts'] = self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()[0]
-            stats['oe'] = self.conn.execute("SELECT COUNT(*) FROM oe_data").fetchone()[0]
-            stats['cross'] = self.conn.execute("SELECT COUNT(*) FROM cross_references").fetchone()[0]
-            stats['prices'] = self.conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
-            stats['brands'] = self.conn.execute("SELECT COUNT(DISTINCT brand) FROM parts_data").fetchone()[0]
-            stats['unique_parts'] = self.conn.execute("""
-                SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)
-            """).fetchone()[0]
-
-            avg_price_result = self.conn.execute("SELECT AVG(price) FROM prices WHERE price IS NOT NULL").fetchone()
-            stats['avg_price'] = round(avg_price_result[0], 2) if avg_price_result and avg_price_result[0] else 0.0
-
-        except Exception as e:
-            st.error(f"❌ Ошибка при сборе статистики: {e}")
-            return
-
-        # Вывод метрик
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Уникальные товары", f"{stats['unique_parts']:,}")
-        col2.metric("Бренды", f"{stats['brands']:,}")
-        col3.metric("Средняя цена", f"{stats['avg_price']} ₽")
-
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Записи (parts)", f"{stats['parts']:,}")
-        col2.metric("OE-номера", f"{stats['oe']:,}")
-        col3.metric("Кроссы", f"{stats['cross']:,}")
-
-        col1, col2 = st.columns(2)
-        col1.metric("Ценовые записи", f"{stats['prices']:,}")
-        col2.metric("Размер файла БД", f"{os.path.getsize(self.db_path) / (1024**2):.1f} МБ")
-
-        # Топ брендов по количеству
-        st.subheader("🏆 Топ-10 брендов по количеству артикулов")
-        try:
-            top_brands = self.conn.execute("""
-                SELECT brand, COUNT(*) as cnt
-                FROM parts_data
-                WHERE brand IS NOT NULL
-                GROUP BY brand
-                ORDER BY cnt DESC
-                LIMIT 10
-            """).pl()
-            st.dataframe(top_brands.to_pandas(), use_container_width=True)
-        except Exception as e:
-            st.warning(f"Не удалось загрузить топ брендов: {e}")
-
-        # Распределение по категориям (если есть)
-        st.subheader("🗂️ Распределение по категориям")
-        try:
-            category_stats = self.conn.execute("""
-                SELECT 
-                    COALESCE(representative_category, 'Разное') as category,
-                    COUNT(*) as cnt
-                FROM (
-                    SELECT DISTINCT p.artikul_norm, p.brand_norm, pd.representative_category
-                    FROM parts_data p
-                    LEFT JOIN part_details_view pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
+        for col in dimension_cols:
+            if col in df.columns:
+                expressions.append(
+                    pl.when(pl.col(col).is_not_null())
+                      .then(pl.col(col).cast(pl.Utf8))
+                      .otherwise("")
+                      .alias(col)
                 )
-                GROUP BY category
-                ORDER BY cnt DESC
-                LIMIT 15
-            """).pl()
-            st.dataframe(category_stats.to_pandas(), use_container_width=True)
-        except Exception as e:
-            st.warning("Не удалось загрузить статистику по категориям")
 
-    def merge_all_data_parallel(self, file_paths: Dict[str, str], max_workers: int = 4) -> Dict[str, pl.DataFrame]:
-        """
-        Загрузка и обработка всех файлов параллельно для ускорения
-        """
-        results = {}
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {}
-            for file_type, file_path in file_paths.items():
-                if file_path and os.path.exists(file_path):
-                    future = executor.submit(self.read_and_prepare_file, file_path, file_type)
-                    futures[future] = file_type
+        if expressions:
+            df = df.with_columns(expressions)
 
-            for future in as_completed(futures):
-                file_type = futures[future]
-                try:
-                    df = future.result()
-                    if not df.is_empty():
-                        results[file_type] = df
-                        logger.info(f"✅ Успешно обработан файл: {file_type}")
-                    else:
-                        logger.warning(f"⚠️ Файл пуст или не обработан: {file_type}")
-                except Exception as e:
-                    logger.error(f"❌ Ошибка при обработке {file_type}: {e}")
+        # Конвертация в pandas (требуется для openpyxl)
+        pdf = df.to_pandas()
 
-        return results
+        # Проверка на лимит Excel
+        if len(pdf) <= EXCEL_ROW_LIMIT:
+            # Простой экспорт в один лист
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                pdf.to_excel(writer, index=False, sheet_name='Данные')
+        else:
+            # Разбивка на несколько листов
+            num_sheets = (len(pdf) // EXCEL_ROW_LIMIT) + 1
+            st.warning(f"Записей больше {EXCEL_ROW_LIMIT}, будет создано {num_sheets} листов")
+            with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+                for i in range(num_sheets):
+                    start_idx = i * EXCEL_ROW_LIMIT
+                    end_idx = min((i + 1) * EXCEL_ROW_LIMIT, len(pdf))
+                    chunk = pdf.iloc[start_idx:end_idx]
+                    sheet_name = f"Данные_{i + 1}"
+                    chunk.to_excel(writer, index=False, sheet_name=sheet_name)
+
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        st.success(f"✅ Данные экспортированы в Excel: {output_path} ({file_size:.1f} МБ)")
+        return True
+
+    except Exception as e:
+        logger.exception("Ошибка экспорта в Excel")
+        st.error(f"❌ Ошибка экспорта в Excel: {e}")
+        return False
+
+def export_to_parquet(self, output_path: str, selected_columns: Optional[List[str]] = None, include_prices: bool = True, apply_markup: bool = True) -> bool:
+    """Экспорт в Parquet — оптимально для больших данных и аналитики"""
+    st.info("📦 Подготовка экспорта в Parquet...")
+
+    try:
+        query = self.build_export_query(selected_columns, include_prices, apply_markup)
+        df = self.conn.execute(query).pl()  # Используем Polars для оптимального сохранения в Parquet
+
+        # Сохраняем напрямую через Polars
+        df.write_parquet(output_path)
+
+        file_size = os.path.getsize(output_path) / (1024 * 1024)
+        st.success(f"✅ Данные экспортированы в Parquet: {output_path} ({file_size:.1f} МБ)")
+        return True
+
+    except Exception as e:
+        logger.exception("Ошибка экспорта в Parquet")
+        st.error(f"❌ Ошибка экспорта в Parquet: {e}")
+        return False
+
+def show_statistics(self):
+    """Отображение статистики по базе данных"""
+    st.header("📈 Статистика по базе данных")
+
+    stats = {}
+    try:
+        stats['parts'] = self.conn.execute("SELECT COUNT(*) FROM parts_data").fetchone()[0]
+        stats['oe'] = self.conn.execute("SELECT COUNT(*) FROM oe_data").fetchone()[0]
+        stats['cross'] = self.conn.execute("SELECT COUNT(*) FROM cross_references").fetchone()[0]
+        stats['prices'] = self.conn.execute("SELECT COUNT(*) FROM prices").fetchone()[0]
+        stats['brands'] = self.conn.execute("SELECT COUNT(DISTINCT brand) FROM parts_data").fetchone()[0]
+        stats['unique_parts'] = self.conn.execute("""
+            SELECT COUNT(*) FROM (SELECT DISTINCT artikul_norm, brand_norm FROM parts_data)
+        """).fetchone()[0]
+
+        avg_price_result = self.conn.execute("SELECT AVG(price) FROM prices WHERE price IS NOT NULL").fetchone()
+        stats['avg_price'] = round(avg_price_result[0], 2) if avg_price_result and avg_price_result[0] else 0.0
+
+    except Exception as e:
+        st.error(f"❌ Ошибка при сборе статистики: {e}")
+        return
+
+    # Вывод метрик
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Уникальные товары", f"{stats['unique_parts']:,}")
+    col2.metric("Бренды", f"{stats['brands']:,}")
+    col3.metric("Средняя цена", f"{stats['avg_price']} ₽")
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Записи (parts)", f"{stats['parts']:,}")
+    col2.metric("OE-номера", f"{stats['oe']:,}")
+    col3.metric("Кроссы", f"{stats['cross']:,}")
+
+    col1, col2 = st.columns(2)
+    col1.metric("Ценовые записи", f"{stats['prices']:,}")
+    col2.metric("Размер файла БД", f"{os.path.getsize(self.db_path) / (1024**2):.1f} МБ")
+
+    # Топ брендов по количеству
+    st.subheader("🏆 Топ-10 брендов по количеству артикулов")
+    try:
+        top_brands = self.conn.execute("""
+            SELECT brand, COUNT(*) as cnt
+            FROM parts_data
+            WHERE brand IS NOT NULL
+            GROUP BY brand
+            ORDER BY cnt DESC
+            LIMIT 10
+        """).pl()
+        st.dataframe(top_brands.to_pandas(), use_container_width=True)
+    except Exception as e:
+        st.warning(f"Не удалось загрузить топ брендов: {e}")
+
+    # Распределение по категориям (если есть)
+    st.subheader("🗂️ Распределение по категориям")
+    try:
+        category_stats = self.conn.execute("""
+            SELECT 
+                COALESCE(representative_category, 'Разное') as category,
+                COUNT(*) as cnt
+            FROM (
+                SELECT DISTINCT p.artikul_norm, p.brand_norm, pd.representative_category
+                FROM parts_data p
+                LEFT JOIN part_details_view pd ON p.artikul_norm = pd.artikul_norm AND p.brand_norm = pd.brand_norm
+            )
+            GROUP BY category
+            ORDER BY cnt DESC
+            LIMIT 15
+        """).pl()
+        st.dataframe(category_stats.to_pandas(), use_container_width=True)
+    except Exception as e:
+        st.warning("Не удалось загрузить статистику по категориям")
+
+def merge_all_data_parallel(self, file_paths: Dict[str, str], max_workers: int = 4) -> Dict[str, pl.DataFrame]:
+    """
+    Загрузка и обработка всех файлов параллельно для ускорения
+    """
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {}
+        for file_type, file_path in file_paths.items():
+            if file_path and os.path.exists(file_path):
+                future = executor.submit(self.read_and_prepare_file, file_path, file_type)
+                futures[future] = file_type
+
+        for future in as_completed(futures):
+            file_type = futures[future]
+            try:
+                df = future.result()
+                if not df.is_empty():
+                    results[file_type] = df
+                    logger.info(f"✅ Успешно обработан файл: {file_type}")
+                else:
+                    logger.warning(f"⚠️ Файл пуст или не обработан: {file_type}")
+            except Exception as e:
+                logger.error(f"❌ Ошибка при обработке {file_type}: {e}")
+
+    return results
 
 
 def main():
@@ -1900,5 +1896,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
-        
