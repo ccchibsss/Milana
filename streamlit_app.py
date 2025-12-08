@@ -432,7 +432,7 @@ class HighVolumeAutoPartsCatalog:
     def process_and_load_data(self, dataframes: Dict[str, pl.DataFrame]):
         """Основной метод загрузки данных в базу с прогресс-баром"""
         st.info("🔄 Начало загрузки и обновления данных в базе...")
-        steps = [s for s in ['oe', 'cross', 'parts import platform
+        steps = [s for s in ['oe', 'cross', 'parts'] if s in dataframes]
 import sys
 import polars as pl
 import duckdb
@@ -866,7 +866,7 @@ class HighVolumeAutoPartsCatalog:
     def process_and_load_data(self, dataframes: Dict[str, pl.DataFrame]):
         """Основной метод загрузки данных в базу с прогресс-баром"""
         st.info("🔄 Начало загрузки и обновления данных в базе...")
-        steps = [s for s in ['oe', 'cross', 'parts] if s in dataframes]
+        steps = [s for s in ['oe', 'cross', 'parts'] if s in dataframes]
     num_steps = len(steps)
     progress_bar = st.progress(0, text="Подготовка к обновлению базы данных...")
     step_counter = 0
@@ -1233,46 +1233,49 @@ def show_price_settings(self):
     st.header("💰 Управление ценами и наценками")
 
     # Общая наценка
-    st.subheader("Общая наценка")
-    global_markup = st.number_input(
-        "Общая наценка (%):
-        min_value=0.0,
+st.subheader("Общая наценка")
+global_markup = st.number_input(
+    "Общая наценка (%):",
+    min_value=0.0,
+    max_value=100.0,
+    value=self.price_rules['global_markup'] * 100,
+    step=0.1
+)
+self.price_rules['global_markup'] = global_markup / 100
+
+       # Наценки по брендам
+st.subheader("Наценки по брендам")
+brand_markups = self.price_rules.get('brand_markups', {})
+
+try:
+    brands_result = self.conn.execute("SELECT DISTINCT brand FROM parts_data WHERE brand IS NOT NULL ORDER BY brand").fetchall()
+    available_brands = [row[0] for row in brands_result] if brands_result else []
+except Exception as e:
+    logger.error(f"Ошибка при получении списка брендов: {e}")
+    st.error("❌ Ошибка при загрузке брендов")
+    available_brands = []
+
+if available_brands:
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        selected_brand = st.selectbox("Выберите бренд:", available_brands)
+    with col2:
+        current_markup = brand_markups.get(selected_brand, self.price_rules.get('global_markup', 0))
+        brand_markup = st.number_input(
+            "Наценка (%):",
+            min_value=0.0,
             max_value=100.0,
-            value=self.price_rules['global_markup'] * 100,
-            step=0.1
+            value=current_markup * 100,
+            step=0.1,
+            key=f"markup_{selected_brand}"
         )
-        self.price_rules['global_markup'] = global_markup / 100
-
-        # Наценки по брендам
-    st.subheader("Наценки по брендам")
-    brand_markups = self.price_rules['brand_markups']
-
-    try:
-        brands_result = self.conn.execute("SELECT DISTINCT brand FROM parts_data WHERE brand IS NOT NULL ORDER BY brand").fetchall()
-        available_brands = [row[0] for row in brands_result] if brands_result else []
-    except Exception as e:
-        logger.error(f"Ошибка при получении списка брендов: {e}")
-        st.error("❌ Ошибка при загрузке брендов")
-        available_brands = []
-
-    if available_brands:
-        col1, col2 = st.columns([2, 1])
-        with col1:
-            selected_brand = st.selectbox("Выберите бренд:", available_brands)
-        with col2:
-            brand_markup = st.number_input(
-                "Наценка (%):",
-                min_value=0.0,
-                max_value=100.0,
-                value=brand_markups.get(selected_brand, self.price_rules['global_markup']) * 100,
-                step=0.1,
-                key=f"markup_{selected_brand}"
-            )
-        if st.button("Сохранить наценку", key=f"save_{selected_brand}"):
-            self.price_rules['brand_markups'][selected_brand] = brand_markup / 100
-            self.save_price_rules()
-            st.success(f"✅ Наценка для {selected_brand} сохранена")
-
+    if st.button("Сохранить наценку", key=f"save_{selected_brand}"):
+        # Обновляем словарь наценок
+        brand_markups[selected_brand] = brand_markup / 100
+        self.price_rules['brand_markups'] = brand_markups
+        self.save_price_rules()
+        st.success(f"✅ Наценка для {selected_brand} сохранена")
+        
     # Ограничения цен
     st.subheader("Ограничения по ценам")
     col1, col2 = st.columns(2)
@@ -1647,21 +1650,31 @@ def export_to_excel_optimized(self, output_path: str, selected_columns: Optional
 
     st.info(f"📊 Подготовка экспорта в Excel: {total_records:,} записей...")
 
-        try:
-            query = self.build_export_query(selected_columns, include_prices, apply_markup)
-            df = self.conn.execute(query).pl()
-
+try:
+    import pandas as pd
+    query = self.build_export_query(selected_columns, include_prices, apply_markup)
+    df = pd.read_sql(query, self.conn)
+    
+    # Далее ваш код по сохранению df в Excel
+except Exception as e:
+    st.error(f"Ошибка при подготовке данных: {e}")
+    
         # Преобразуем размерные колонки в строки
-            dimension_cols = ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]
-            for col in dimension_cols:
-                if col in df.columns:
-                    df = df.with_columns(
-                        pl.when(pl.col(col).is_not_null())
-                         .then(pl.col(col).cast(pl.Utf8))
-                         .otherwise(pl.lit(""))
-                         .alias(col)
-                    )
+dimension_cols = ["Длинна", "Ширина", "Высота", "Вес", "Длинна/Ширина/Высота", "Кратность"]
+expressions = []
 
+for col in dimension_cols:
+    if col in df.columns:
+        expressions.append(
+            pl.when(pl.col(col).is_not_null())
+              .then(pl.col(col).cast(pl.Utf8))
+              .otherwise("")
+              .alias(col)
+        )
+
+if expressions:
+    df = df.with_columns(expressions)
+    
             # Конвертация в pandas (требуется для openpyxl)
             pdf = df.to_pandas()
 
