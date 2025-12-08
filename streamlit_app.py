@@ -1676,14 +1676,14 @@ if expressions:
     df = df.with_columns(expressions)
     
             # Конвертация в pandas (требуется для openpyxl)
-            pdf = df.to_pandas()
+    pdf = df.to_pandas()
 
             # Проверка на лимит Excel
-            if len(pdf) <= EXCEL_ROW_LIMIT:
+    if len(pdf) <= EXCEL_ROW_LIMIT:
                 # Простой экспорт в один лист
                 with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
                     pdf.to_excel(writer, index=False, sheet_name='Данные')
-            else:
+    else:
                 # Разбивка на несколько листов
                 num_sheets = (len(pdf) // EXCEL_ROW_LIMIT) + 1
                 st.warning(f"Записей больше {EXCEL_ROW_LIMIT}, будет создано {num_sheets} листов")
@@ -1696,7 +1696,7 @@ if expressions:
                         sheet_name = f"Данные_{i + 1}"
                         chunk.to_excel(writer, index=False, sheet_name=sheet_name)
 
-            file_size = os.path.getsize(output_path) / (1024 * 1024)
+     file_size = os.path.getsize(output_path) / (1024 * 1024)
             st.success(f"✅ Данные экспортированы в Excel: {output_path} ({file_size:.1f} МБ)")
             return True
 
