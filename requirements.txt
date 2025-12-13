@@ -3,3 +3,4 @@ rembg>=2.0.62
 onnxruntime>=1.15.0
 opencv-python>=4.8.0
 numpy>=1.24.4
+Pillow
