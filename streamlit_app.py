@@ -5,6 +5,8 @@ from io import BytesIO
 from rembg import remove
 import cv2
 import numpy as np
+from typing import Optional, Union
+
 
 # Настройка страницы
 st.set_page_config(
@@ -16,8 +18,8 @@ st.set_page_config(
 # Стили для улучшения внешнего вида
 st.markdown("""
 <style>
-    .stProgress .st-bo {
-        background-color: #4CAF50;
+    .stProgress > div > div > div > div {
+        background-color: #4CAF50 !important;
     }
     .success-box {
         background-color: #d4edda;
@@ -39,11 +41,10 @@ st.markdown("""
 st.title("🖼️ Массовое удаление фона и водяных знаков из изображений")
 st.markdown("Загрузите одно или несколько изображений для автоматического удаления фона и водяных знаков.")
 
-# Разделяем интерфейс на два столбца
-col1, col2 = st.columns([1, 1])
+# Интерфейс: два столбца
+col1, col2 = st.columns(2)
 
 with col1:
-    # Загрузка изображений
     uploaded_files = st.file_uploader(
         "Загрузите изображения (PNG, JPG, JPEG)",
         type=["png", "jpg", "jpeg"],
@@ -52,28 +53,28 @@ with col1:
     )
 
 with col2:
-    # Настройки обработки
     st.subheader("Настройки обработки:")
     save_folder = st.text_input("Папка для сохранения:", value="processed_images")
     remove_bg = st.checkbox("Удалять фон", value=True)
     remove_watermark = st.checkbox("Удалять водяные знаки", value=False)
     quality = st.slider("Качество выходного файла (%):", min_value=50, max_value=100, value=95)
 
-# Функциональность класса для обработки изображений
+# Класс для обработки изображений
 class BackgroundAndWatermarkRemover:
-    def __init__(self, save_folder="processed_images"):
+    def __init__(self, save_folder: str = "processed_images"):
         self.save_folder = save_folder
         os.makedirs(self.save_folder, exist_ok=True)
 
-    def create_thumbnail(self, image, size=(200, 200)):
+    def create_thumbnail(self, image: Image.Image, size=(200, 200)) -> Image.Image:
         """Создание миниатюры изображения."""
         img = image.copy()
         img.thumbnail(size)
         return img
 
-    def remove_watermark(self, image):
+    def remove_watermark(self, image: Image.Image) -> Image.Image:
         """
-        Эффективно удаляет водяные знаки с изображения путём анализа и маскировки областей с низкой непрозрачностью.
+        Удаление водяных знаков с изображения.
+        Используется морфологическая обработка и inpainting.
         """
         open_cv_image = np.array(image.convert('RGB'))
         gray = cv2.cvtColor(open_cv_image, cv2.COLOR_RGB2GRAY)
@@ -83,67 +84,114 @@ class BackgroundAndWatermarkRemover:
         result = cv2.inpaint(open_cv_image, clean_mask, 3, cv2.INPAINT_TELEA)
         return Image.fromarray(result)
 
-    def process_image(self, image_data, remove_bg=True, remove_watermark=False):
+    def process_image(
+        self,
+        image_data: Union[BytesIO, bytes],
+        remove_bg: bool = True,
+        remove_watermark: bool = False
+    ) -> Optional[Image.Image]:
         """
-        Метод для полной обработки изображения: удаление фона и водяных знаков.
+        Полная обработка изображения: удаление фона и водяных знаков.
         """
-        image = Image.open(image_data).convert("RGBA")
-        open_cv_image = np.array(image)
-        open_cv_image = cv2.cvtColor(open_cv_image, cv2.COLOR_RGBA2BGRA)
+        try:
+            # Если image_data - BytesIO, читаем байты для повторного использования
+            if hasattr(image_data, "read"):
+                image_bytes = image_data.read()
+            else:
+                image_bytes = image_data
 
-        # Удаление фона
-        if remove_bg:
-            try:
-                output = remove(image_data.read())
-                bg_image = Image.open(BytesIO(output))
-            except Exception as e:
-                st.error(f"Ошибка при удалении фона: {e}")
+            image = Image.open(BytesIO(image_bytes)).convert("RGBA")
+
+            # Удаление фона
+            if remove_bg:
+                try:
+                    output = remove(image_bytes)
+                    bg_image = Image.open(BytesIO(output)).convert("RGBA")
+                except Exception as e:
+                    st.error(f"Ошибка при удалении фона: {e}")
+                    bg_image = image
+            else:
                 bg_image = image
-        else:
-            bg_image = image
 
-        # Удаление водяных знаков
-        if remove_watermark and isinstance(bg_image, Image.Image):
-            try:
-                watermark_removed = self.remove_watermark(bg_image)
-                final_image = watermark_removed
-            except Exception as e:
-                st.error(f"Ошибка при удалении водяного знака: {e}")
+            # Удаление водяных знаков
+            if remove_watermark:
+                try:
+                    final_image = self.remove_watermark(bg_image)
+                except Exception as e:
+                    st.error(f"Ошибка при удалении водяных знаков: {e}")
+                    final_image = bg_image
+            else:
                 final_image = bg_image
-        else:
-            final_image = bg_image
 
-        return final_image
+            return final_image
 
-    def save_image(self, filename, image, quality=95):
-        """Метод для сохранения обработанных изображений в заданную папку."""
+        except Exception as e:
+            st.error(f"Ошибка при обработке изображения: {e}")
+            return None
+
+    def save_image(self, filename: str, image: Image.Image, quality: int = 95) -> str:
+        """
+        Сохраняет изображение в указанную папку.
+        Для PNG параметр quality не применяется, используем optimize.
+        """
         save_path = os.path.join(self.save_folder, filename)
-        image.save(save_path, format='PNG', quality=quality)
+        ext = os.path.splitext(filename)[1].lower()
+
+        try:
+            if ext in ['.jpg', '.jpeg']:
+                image = image.convert("RGB")  # JPEG не поддерживает альфа-канал
+                image.save(save_path, format='JPEG', quality=quality, optimize=True)
+            else:
+                # Для PNG и других форматов
+                image.save(save_path, format='PNG', optimize=True)
+        except Exception as e:
+            st.error(f"Ошибка при сохранении файла {filename}: {e}")
+            return ""
+
         return save_path
 
-# Начнём обрабатывать изображения, если они были загружены
+
+# Основной блок обработки
 if uploaded_files:
+    # Проверка и создание папки
+    if not os.path.exists(save_folder):
+        try:
+            os.makedirs(save_folder)
+        except Exception as e:
+            st.error(f"Не удалось создать папку для сохранения: {e}")
+            st.stop()
+
     remover = BackgroundAndWatermarkRemover(save_folder=save_folder)
     progress_bar = st.progress(0)
+    status_text = st.empty()
     total_files = len(uploaded_files)
 
     for idx, uploaded_file in enumerate(uploaded_files):
+        status_text.text(f"Обрабатываю файл {idx + 1} из {total_files}: {uploaded_file.name}")
         with st.spinner(f"Обрабатываю файл {uploaded_file.name}..."):
-            # Основной цикл обработки изображений
-            processed_img = remover.process_image(uploaded_file, remove_bg=remove_bg, remove_watermark=remove_watermark)
-            
-            # Показываем превью результата
+            processed_img = remover.process_image(
+                uploaded_file,
+                remove_bg=remove_bg,
+                remove_watermark=remove_watermark
+            )
+
+            if processed_img is None:
+                st.error(f"Не удалось обработать файл {uploaded_file.name}. Пропускаю.")
+                continue
+
             thumbnail = remover.create_thumbnail(processed_img)
             st.image(thumbnail, caption=f"Предпросмотр {uploaded_file.name}", use_column_width=True)
-        
-            # Сохраняем обработанный файл
-            save_filename = remover.save_image(uploaded_file.name, processed_img, quality=quality)
-            st.success(f"Файл успешно сохранён: {save_filename}.")
-        
-        # Продвигаем прогресс-бар
-        progress_bar.progress((idx+1)/total_files)
 
-    st.balloons()  # Анимационная иконка после завершения обработки
+            save_path = remover.save_image(uploaded_file.name, processed_img, quality=quality)
+            if save_path:
+                st.success(f"Файл успешно сохранён: `{save_path}`")
+            else:
+                st.error(f"Ошибка при сохранении файла {uploaded_file.name}")
+
+        progress_bar.progress((idx + 1) / total_files)
+
+    status_text.text("Обработка завершена.")
+    st.balloons()
     st.write(f"Все файлы успешно сохранены в папку: `{save_folder}`.")
 
 else:
