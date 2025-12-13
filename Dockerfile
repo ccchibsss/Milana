@@ -1,6 +1,6 @@
-FROM python:3.10-slim
+FROM python:3.13-slim
 
-# Установка системных библиотек для OpenCV
+# Обновление и установка системных библиотек для OpenCV
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libglib2.0-0 \
@@ -10,15 +10,18 @@ RUN apt-get update && \
     libgl1-mesa-glx && \
     rm -rf /var/lib/apt/lists/*
 
-# Создаем рабочую директорию
+# Установка рабочей директории
 WORKDIR /app
 
-# Копируем файлы проекта
+# Копируем файлы зависимостей и кода
 COPY requirements.txt ./ 
-COPY app.py ./ 
+COPY streamlit_app.py ./ 
 
-# Установка зависимостей
+# Установка Python зависимостей
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Запуск Streamlit
-CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+# Открываем порт для Streamlit
+EXPOSE 8501
+
+# Запуск приложения Streamlit
+CMD ["streamlit", "run", "streamlit_app.py", "--server.port=8501", "--server.address=0.0.0.0"]
