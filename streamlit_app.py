@@ -7,7 +7,6 @@ import cv2
 import numpy as np
 from typing import Optional, Union
 
-
 # Настройка страницы
 st.set_page_config(
     page_title="Удаление фона и водяных знаков",
@@ -42,28 +41,31 @@ st.title("🖼️ Массовое удаление фона и водяных �
 st.markdown("Загрузите одно или несколько изображений для автоматического удаления фона и водяных знаков.")
 
 # Интерфейс: два столбца
-col1, col2 = st.columns(2)
+col1, col2 = st.columns([2, 1])
 
 with col1:
     uploaded_files = st.file_uploader(
         "Загрузите изображения (PNG, JPG, JPEG)",
         type=["png", "jpg", "jpeg"],
         accept_multiple_files=True,
-        help="Выберите одно или несколько изображений."
+        help="Выберите одно или несколько изображений.",
+        key="file_uploader"
     )
 
 with col2:
     st.subheader("Настройки обработки:")
-    save_folder = st.text_input("Папка для сохранения:", value="processed_images")
-    remove_bg = st.checkbox("Удалять фон", value=True)
-    remove_watermark = st.checkbox("Удалять водяные знаки", value=False)
-    quality = st.slider("Качество выходного файла (%):", min_value=50, max_value=100, value=95)
+    save_folder = st.text_input("Папка для сохранения:", value="processed_images", key="save_folder")
+    remove_bg = st.checkbox("Удалять фон", value=True, key="remove_bg")
+    remove_watermark = st.checkbox("Удалять водяные знаки", value=False, key="remove_watermark")
+    quality = st.slider("Качество выходного файла (%):", min_value=50, max_value=100, value=95, key="quality_slider")
+
+# Создаем папку заранее
+os.makedirs(save_folder, exist_ok=True)
 
 # Класс для обработки изображений
 class BackgroundAndWatermarkRemover:
     def __init__(self, save_folder: str = "processed_images"):
         self.save_folder = save_folder
-        os.makedirs(self.save_folder, exist_ok=True)
 
     def create_thumbnail(self, image: Image.Image, size=(200, 200)) -> Image.Image:
         """Создание миниатюры изображения."""
@@ -150,49 +152,39 @@ class BackgroundAndWatermarkRemover:
 
         return save_path
 
-
 # Основной блок обработки
-if uploaded_files:
-    # Проверка и создание папки
-    if not os.path.exists(save_folder):
-        try:
-            os.makedirs(save_folder)
-        except Exception as e:
-            st.error(f"Не удалось создать папку для сохранения: {e}")
-            st.stop()
-
+if uploaded_files and len(uploaded_files) > 0:
     remover = BackgroundAndWatermarkRemover(save_folder=save_folder)
     progress_bar = st.progress(0)
-    status_text = st.empty()
     total_files = len(uploaded_files)
-
+    
     for idx, uploaded_file in enumerate(uploaded_files):
-        status_text.text(f"Обрабатываю файл {idx + 1} из {total_files}: {uploaded_file.name}")
-        with st.spinner(f"Обрабатываю файл {uploaded_file.name}..."):
+        status_message = f"Обрабатываю файл {idx+1}/{total_files}: {uploaded_file.name}"
+        
+        with st.spinner(status_message):
             processed_img = remover.process_image(
                 uploaded_file,
                 remove_bg=remove_bg,
                 remove_watermark=remove_watermark
             )
-
+            
             if processed_img is None:
                 st.error(f"Не удалось обработать файл {uploaded_file.name}. Пропускаю.")
                 continue
-
+                
             thumbnail = remover.create_thumbnail(processed_img)
             st.image(thumbnail, caption=f"Предпросмотр {uploaded_file.name}", use_column_width=True)
-
+            
             save_path = remover.save_image(uploaded_file.name, processed_img, quality=quality)
             if save_path:
                 st.success(f"Файл успешно сохранён: `{save_path}`")
             else:
                 st.error(f"Ошибка при сохранении файла {uploaded_file.name}")
-
+        
         progress_bar.progress((idx + 1) / total_files)
 
-    status_text.text("Обработка завершена.")
     st.balloons()
     st.write(f"Все файлы успешно сохранены в папку: `{save_folder}`.")
 
-else:
+elif uploaded_files is None or len(uploaded_files) == 0:
     st.info("Пожалуйста, загрузите хотя бы одно изображение для начала обработки.")
