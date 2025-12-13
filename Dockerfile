@@ -1,6 +1,6 @@
 FROM python:3.13-slim
 
-# Обновляем пакеты и устанавливаем необходимые системные библиотеки
+# Установка системных зависимостей
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1-mesa-glx \
@@ -8,15 +8,17 @@ RUN apt-get update && \
         python3-distutils \
     && rm -rf /var/lib/apt/lists/*
 
-# Копируем requirements
-COPY requirements.txt /app/requirements.txt
+# Создаем рабочую директорию
 WORKDIR /app
 
-# Устанавливаем зависимости Python
-RUN pip install --no-cache-dir -r requirements.txt
+# Копируем requirements.txt
+COPY requirements.txt .
 
-# Копируем приложение
-COPY app.py /app/app.py
+# Устанавливаем Python зависимости
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
+
+# Копируем остальной код
+COPY . .
 
 # Запуск Streamlit
-CMD ["streamlit", "run", "app.py"]
+CMD ["streamlit", "run", "streamlit_app.py"]
