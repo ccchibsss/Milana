@@ -1,19 +1,22 @@
-# Базовый образ Python
-FROM python:3.11-slim
+FROM python:3.13-slim
 
 # Обновляем пакеты и устанавливаем необходимые системные библиотеки
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         libgl1-mesa-glx \
-        && rm -rf /var/lib/apt/lists/*
+        build-essential \
+        python3-distutils \
+    && rm -rf /var/lib/apt/lists/*
 
-# Установка зависимостей Python
+# Копируем requirements
 COPY requirements.txt /app/requirements.txt
 WORKDIR /app
+
+# Устанавливаем зависимости Python
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем ваш скрипт в контейнер
+# Копируем приложение
 COPY app.py /app/app.py
 
-# Указываем команду запуска
+# Запуск Streamlit
 CMD ["streamlit", "run", "app.py"]
