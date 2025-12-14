@@ -1,10 +1,10 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Исправленная версия Photo Processor Pro (CLI + Streamlit)
-- Поправлены синтаксические и логические ошибки
-- Добавлен раздел скачивания результатов (ZIP) для Streamlit
-- Упрощён и стабилизирован конвейер обработки
+Исправленная и упрощённая версия Photo Processor Pro (CLI + Streamlit)
+- Убраны синтаксические ошибки
+- Стабилизирован CLI / Streamlit режим
+- Добавлен скачиваемый ZIP в Streamlit
 """
 
 from __future__ import annotations
@@ -12,9 +12,8 @@ import argparse
 import io
 import json
 import logging
-import os
-import sys
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -24,10 +23,10 @@ from typing import List, Optional, Tuple, Dict, Any
 import cv2
 import numpy as np
 from PIL import Image, UnidentifiedImageError
-from concurrent.futures import ThreadPoolExecutor as TPE, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import multiprocessing as mp
 
-# Optional dependencies
+# Optional deps
 try:
     from rembg import remove as rembg_remove
     HAS_REMBG = True
@@ -42,7 +41,20 @@ except Exception:
     st = None
     HAS_STREAMLIT = False
 
-# --- Конфигурация и логирование ---
+# logger
+def setup_logger() -> logging.Logger:
+    fn = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        handlers=[logging.FileHandler(fn, encoding="utf-8"), logging.StreamHandler()],
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logger()
+
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
 @dataclass
 class ProcessingConfig:
     remove_bg: bool = True
@@ -53,81 +65,28 @@ class ProcessingConfig:
     jpeg_q: int = 95
     target_width: Optional[int] = None
     target_height: Optional[int] = None
-
     inp: Path = Path("./input")
     outp: Path = Path("./output")
 
-
-def setup_logger() -> logging.Logger:
-    fn = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[
-            logging.FileHandler(fn, encoding="utf-8"),
-            logging.StreamHandler()
-        ],
-    )
-    return logging.getLogger(__name__)
-
-
-logger = setup_logger()
-
-# --- Валидация путей и файлов ---
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-
-
 def validate_path(path: Path, is_input: bool = True) -> Tuple[bool, str]:
     try:
-        if not path.exists():
-            if is_input:
-                return False, f"Путь не существует: {path}"
-            return True, ""
-        if is_input and not path.is_dir():
-            return False, f"Не каталог: {path}"
-        # Проверка прав: попытаться перечислить или создать временный файл
         if is_input:
-            _ = next(path.iterdir(), None)
+            if not path.exists() or not path.is_dir():
+                return False, f"Входная папка не найдена или не каталог: {path}"
         else:
-            tmp = path / ".tmp_permission_check"
-            tmp.write_text("x")
-            tmp.unlink()
+            # output: allow not exists (we will create), but check parent permission
+            parent = path if path.exists() else path.parent
+            if not parent.exists():
+                parent.mkdir(parents=True, exist_ok=True)
         return True, ""
     except PermissionError:
         return False, f"Нет прав доступа: {path}"
     except Exception as e:
         return False, f"Ошибка проверки: {e}"
 
-
 def validate_file_extension(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
-# --- Загрузка/сохранение конфигурации ---
-def load_config(config_path: str) -> Dict[str, Any]:
-    try:
-        with open(config_path, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-            required = ["input_dir", "output_dir"]
-            for key in required:
-                if key not in cfg:
-                    raise ValueError(f"Отсутствует ключ {key} в config")
-            return cfg
-    except FileNotFoundError:
-        logger.warning("config.json не найден, используются значения по умолчанию")
-        return {}
-    except (json.JSONDecodeError, ValueError) as e:
-        logger.error(f"Ошибка конфигурации: {e}")
-        return {}
-
-
-def save_config(config: Dict[str, Any], config_path: str):
-    try:
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2, ensure_ascii=False)
-    except Exception as e:
-        logger.exception(f"Не удалось сохранить конфигурацию: {e}")
-
-# --- Обработка изображений ---
 def rembg_background(pil_img: Image.Image) -> Image.Image:
     if not HAS_REMBG or rembg_remove is None:
         return pil_img
@@ -140,7 +99,6 @@ def rembg_background(pil_img: Image.Image) -> Image.Image:
     except Exception:
         logger.exception("rembg failed")
     return pil_img
-
 
 def grabcut_background(pil_img: Image.Image) -> Image.Image:
     try:
@@ -164,15 +122,13 @@ def grabcut_background(pil_img: Image.Image) -> Image.Image:
         logger.exception("grabcut failed")
         return pil_img
 
-
 def remove_background(pil_img: Image.Image, config: ProcessingConfig) -> Image.Image:
     if config.remove_bg and HAS_REMBG:
         try:
             return rembg_background(pil_img)
         except Exception:
-            logger.warning("rembg не удалось, используем grabcut")
+            logger.warning("rembg failed, fallback to grabcut")
     return grabcut_background(pil_img)
-
 
 def remove_watermark(img_cv: np.ndarray, config: ProcessingConfig) -> np.ndarray:
     if not config.remove_wm:
@@ -190,24 +146,21 @@ def remove_watermark(img_cv: np.ndarray, config: ProcessingConfig) -> np.ndarray
                 cv2.drawContours(mask, [c], -1, 255, -1)
         if np.any(mask):
             inpainted = cv2.inpaint(bgr, mask, config.wm_radius, cv2.INPAINT_TELEA)
-            if img_cv.ndim == 3 and (img_cv.shape[2] == 3 or img_cv.shape[2] == 4):
-                if img_cv.shape[2] == 4:
-                    out = cv2.cvtColor(inpainted, cv2.COLOR_BGR2BGRA)
-                    out[..., 3] = img_cv[..., 3]
-                    return out
+            if img_cv.ndim == 3:
                 return inpainted
-            return inpainted
+            # preserve alpha
+            out = cv2.cvtColor(inpainted, cv2.COLOR_BGR2BGRA)
+            out[..., 3] = img_cv[..., 3]
+            return out
         return img_cv
     except Exception:
         logger.exception("remove_watermark failed")
         return img_cv
 
-
 def resize_image(img_cv: np.ndarray, target_width: Optional[int], target_height: Optional[int]) -> np.ndarray:
     h, w = img_cv.shape[:2]
     if (not target_width or target_width <= 0) and (not target_height or target_height <= 0):
         return img_cv
-
     if target_width and target_height:
         return cv2.resize(img_cv, (target_width, target_height), interpolation=cv2.INTER_AREA)
     if target_width and target_width > 0:
@@ -216,35 +169,17 @@ def resize_image(img_cv: np.ndarray, target_width: Optional[int], target_height:
     scale = target_height / h
     return cv2.resize(img_cv, (int(w * scale), target_height), interpolation=cv2.INTER_AREA)
 
-
-def save_image(
-    img_cv: np.ndarray,
-    out_path: Path,
-    config: ProcessingConfig
-) -> bool:
+def save_image(img_cv: np.ndarray, out_path: Path, config: ProcessingConfig) -> bool:
     try:
-        if config.target_width and (config.target_width <= 0 or config.target_width > 10000):
-            logger.error(f"Недопустимая ширина: {config.target_width}")
-            return False
-        if config.target_height and (config.target_height <= 0 or config.target_height > 10000):
-            logger.error(f"Недопустимая высота: {config.target_height}")
-            return False
-
         out_path.parent.mkdir(parents=True, exist_ok=True)
         img_cv = resize_image(img_cv, config.target_width, config.target_height)
-
         if config.fmt.upper() == "PNG":
-            # PNG supports alpha
-            success = cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 3])
-            return bool(success)
-
+            return bool(cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 3]))
+        # JPEG: drop alpha
         bgr = img_cv
         if img_cv.ndim == 3 and img_cv.shape[2] == 4:
             bgr = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2BGR)
-
-        success, buf = cv2.imencode(
-            ".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(config.jpeg_q)]
-        )
+        success, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(config.jpeg_q)])
         if success:
             out_path.write_bytes(buf.tobytes())
             return True
@@ -253,374 +188,190 @@ def save_image(
         logger.exception("save_image failed")
         return False
 
-# --- Обработка задач ---
-def process_single_task(task: Tuple[str, str, Any], config: ProcessingConfig) -> str:
-    src_type, name, payload = task
+def process_single_task(src_path: Path, out_dir: Path, config: ProcessingConfig) -> str:
+    name = src_path.name
     try:
-        # Чтение изображения
-        if src_type == "disk":
-            src_path = config.inp / name
-            pil = Image.open(src_path).convert("RGBA")
-        else:  # uploaded
-            data = payload
-            if hasattr(data, "read"):
-                buf = data.read()
-            elif isinstance(data, (bytes, bytearray)):
-                buf = data
-            else:
-                buf = bytes(data)
-            pil = Image.open(io.BytesIO(buf)).convert("RGBA")
-
-        # Удаление фона
-        processed_pil = remove_background(pil, config)
-
-        # Преобразование в OpenCV (RGBA -> BGRA)
-        img_cv = cv2.cvtColor(np.array(processed_pil), cv2.COLOR_RGBA2BGRA)
-
-        # Удаление водяных знаков
+        pil = Image.open(src_path).convert("RGBA")
+        processed = remove_background(pil, config)
+        img_cv = cv2.cvtColor(np.array(processed), cv2.COLOR_RGBA2BGRA)
         img_cv = remove_watermark(img_cv, config)
-
-        # Формирование пути сохранения
         ext = ".png" if config.fmt.upper() == "PNG" else ".jpg"
-        out_name = Path(name).stem + ext
-        out_path = config.outp / out_name
-
+        out_name = src_path.stem + ext
+        out_path = out_dir / out_name
         if save_image(img_cv, out_path, config):
             return f"✅ {name} -> {out_name}"
-        else:
-            return f"❌ Ошибка сохранения {name}"
-
+        return f"❌ Ошибка сохранения {name}"
     except UnidentifiedImageError:
         return f"❌ Невозможно открыть {name} (не изображение/повреждён)"
     except Exception as e:
-        logger.exception(f"Ошибка обработки {name}: {e}")
-        return f"❌ Ошибка обработки {name}: {str(e)}"
+        logger.exception("Ошибка обработки %s: %s", name, e)
+        return f"❌ Ошибка обработки {name}: {e}"
 
-def process_batch(
-    input_dir: str,
-    output_dir: str,
-    config: ProcessingConfig,
-    selected_filenames: Optional[List[str]] = None,
-    uploaded_files: Optional[List[Any]] = None
-) -> List[str]:
+def process_batch(input_dir: str, output_dir: str, config: ProcessingConfig,
+                  selected_filenames: Optional[List[str]] = None) -> List[str]:
     inp = Path(input_dir).expanduser().resolve()
     outp = Path(output_dir).expanduser().resolve()
     config.inp = inp
     config.outp = outp
 
-    # Валидация путей
-    valid, msg = validate_path(inp, is_input=True)
-    if not valid:
+    ok, msg = validate_path(inp, is_input=True)
+    if not ok:
         return [f"[ОШИБКА] {msg}"]
-    valid, msg = validate_path(outp, is_input=False)
-    if not valid:
+    ok, msg = validate_path(outp, is_input=False)
+    if not ok:
         return [f"[ОШИБКА] {msg}"]
     outp.mkdir(parents=True, exist_ok=True)
 
-    # Формирование списка задач
-    tasks: List[Tuple[str, str, Any]] = []
-    if uploaded_files:
-        for f in uploaded_files:
-            name = getattr(f, "name", None) or (f[0] if isinstance(f, (tuple, list)) else None)
-            data = f
-            if not name:
-                continue
-            if validate_file_extension(Path(name)):
-                tasks.append(("uploaded", name, data))
-            else:
-                logger.warning(f"Пропущен файл (неподдерживаемый формат): {name}")
-    else:
-        files = [p for p in inp.iterdir() if p.is_file() and validate_file_extension(p)]
-        for p in files:
-            name = p.name
-            if selected_filenames and name not in selected_filenames:
-                continue
-            tasks.append(("disk", name, None))
-
-    if not tasks:
+    files = [p for p in inp.iterdir() if p.is_file() and validate_file_extension(p)]
+    if selected_filenames:
+        files = [p for p in files if p.name in selected_filenames]
+    if not files:
         return ["[ПРЕДУПРЕЖДЕНИЕ] Не найдено изображений для обработки."]
 
     logs: List[str] = []
     max_workers = min(4, max(1, mp.cpu_count()))
-
-    with TPE(max_workers=max_workers) as executor:
-        futures = [executor.submit(process_single_task, task, config) for task in tasks]
-        for future in as_completed(futures):
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(process_single_task, p, outp, config): p for p in files}
+        for fut in as_completed(futures):
             try:
-                res = future.result()
+                res = fut.result()
                 logs.append(res)
                 logger.info(res)
             except Exception as e:
                 logger.exception("Worker error")
                 logs.append(f"❌ Неожиданная ошибка: {e}")
-
     return logs
-
-# --- Утилиты ---
-def choose_output_folder(base: str = ".", use_streamlit_ui: bool = False) -> Path:
-    base_p = Path(base).expanduser().resolve()
-    base_p.mkdir(parents=True, exist_ok=True)
-    if use_streamlit_ui and HAS_STREAMLIT:
-        st.info(f"База для выбора: {base_p}")
-        dirs = [base_p] + sorted([p for p in base_p.iterdir() if p.is_dir() and p != base_p])
-        for i, d in enumerate(dirs, start=1):
-            st.write(f"{i:2d}. {d}")
-        st.write("0. Ввести путь вручную")
-        st.write("c. Создать новую папку внутри базы")
-
-        choice = st.text_input("Выберите номер, 0, c или Q для выхода").strip().lower()
-        if choice == "q":
-            st.stop()
-        if choice == "0":
-            p = Path(st.text_input("Введите путь:").strip()).expanduser().resolve()
-            if p.exists() and p.is_dir():
-                st.success(f"Выбрана папка: {p}")
-                return p
-            create = st.text_input(f"Папка '{p}' не существует. Создать? (y/N)").strip().lower()
-            if create == "y":
-                p.mkdir(parents=True, exist_ok=True)
-                st.success(f"Папка создана и выбрана: {p}")
-                return p
-        elif choice == "c":
-            name = st.text_input("Имя новой папки:").strip()
-            if name:
-                p = base_p / name
-                p.mkdir(parents=True, exist_ok=True)
-                st.success(f"Папка создана и выбрана: {p}")
-                return p
-            else:
-                st.warning("Имя не указано.")
-        else:
-            try:
-                idx = int(choice)
-                dirs = [base_p] + sorted([p for p in base_p.iterdir() if p.is_dir() and p != base_p])
-                if 1 <= idx <= len(dirs):
-                    selected = dirs[idx - 1]
-                    st.success(f"Выбрана папка: {selected}")
-                    return selected
-            except Exception:
-                st.warning("Неверный выбор. Попробуйте ещё раз.")
-        st.error("Не удалось выбрать папку. Обработка прервана.")
-        st.stop()
-    else:
-        # CLI interactive choice
-        print(f"База для выбора: {base_p}")
-        dirs = [base_p] + sorted([p for p in base_p.iterdir() if p.is_dir() and p != base_p])
-        for i, d in enumerate(dirs, start=1):
-            print(f"{i:2d}. {d}")
-        print("0. Ввести путь вручную")
-        print("c. Создать новую папку внутри базы")
-        choice = input("Выберите номер, 0, c или Q для выхода: ").strip().lower()
-        if choice == "q":
-            print("Выход.")
-            sys.exit(0)
-        if choice == "0":
-            p = Path(input("Введите путь: ").strip()).expanduser().resolve()
-            if p.exists() and p.is_dir():
-                print(f"Выбрана папка: {p}")
-                return p
-            create = input(f"Папка '{p}' не существует. Создать? (y/N): ").strip().lower()
-            if create == "y":
-                p.mkdir(parents=True, exist_ok=True)
-                print(f"Папка создана и выбрана: {p}")
-                return p
-        elif choice == "c":
-            name = input("Имя новой папки: ").strip()
-            if name:
-                p = base_p / name
-                p.mkdir(parents=True, exist_ok=True)
-                print(f"Папка создана и выбрана: {p}")
-                return p
-            else:
-                print("Имя не указано.")
-        else:
-            try:
-                idx = int(choice)
-                if 1 <= idx <= len(dirs):
-                    selected = dirs[idx - 1]
-                    print(f"Выбрана папка: {selected}")
-                    return selected
-            except Exception:
-                print("Неверный выбор. Попробуйте ещё раз.")
-        print("Не удалось выбрать папку. Прервано.")
-        sys.exit(1)
-
 
 def create_zip_of_output(output_dir: str, zip_name: Optional[str] = None) -> Path:
     outp = Path(output_dir).expanduser().resolve()
     if not outp.exists() or not outp.is_dir():
         raise FileNotFoundError(f"Выходная папка не найдена: {outp}")
-
     base_name = zip_name or f"{outp.name}_results"
     tmp_dir = Path(tempfile.gettempdir())
     zip_base = tmp_dir / base_name
     zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=str(outp))
     return Path(zip_path)
 
-# --- CLI ---
+def choose_output_folder_cli(base: str = ".") -> Path:
+    base_p = Path(base).expanduser().resolve()
+    base_p.mkdir(parents=True, exist_ok=True)
+    dirs = [d for d in [base_p] + sorted([p for p in base_p.iterdir() if p.is_dir()])][:10]
+    print(f"База для выбора: {base_p}")
+    for i, d in enumerate(dirs, start=1):
+        print(f"{i}. {d}")
+    print("0 - использовать базовую папку; или введите путь")
+    choice = input("Выбор: ").strip()
+    if choice == "0" or choice == "":
+        return base_p
+    try:
+        idx = int(choice)
+        if 1 <= idx <= len(dirs):
+            return dirs[idx - 1]
+    except Exception:
+        pass
+    p = Path(choice).expanduser().resolve()
+    if not p.exists():
+        p.mkdir(parents=True, exist_ok=True)
+    return p
+
 def run_cli(argv=None):
     parser = argparse.ArgumentParser(description="Photo Processor Pro (CLI)")
     parser.add_argument("--input", "-i", default="./input", help="Папка с изображениями")
     parser.add_argument("--output", "-o", default=None, help="Куда сохранять (если не указано — интерактивно)")
     parser.add_argument("--no-bg", dest="remove_bg", action="store_false", help="Отключить удаление фона")
     parser.add_argument("--wm", dest="remove_wm", action="store_true", help="Включить удаление водяных знаков")
-    parser.add_argument("--wm-threshold", type=int, default=220, help="Порог для удаления водяных знаков (0–255)")
-    parser.add_argument("--wm-radius", type=int, default=5, help="Радиус inpaint")
-    parser.add_argument("--fmt", choices=["PNG", "JPEG"], default="PNG", help="Формат выходного изображения")
-    parser.add_argument("--jpeg-q", type=int, default=95, help="Качество JPEG (1–100)")
-    parser.add_argument("--width", type=int, default=None, help="Ширина выходного изображения")
-    parser.add_argument("--height", type=int, default=None, help="Высота выходного изображения")
-    parser.add_argument("--config", default="config.json", help="Путь к конфигурационному файлу")
-
+    parser.add_argument("--wm-threshold", type=int, default=220)
+    parser.add_argument("--wm-radius", type=int, default=5)
+    parser.add_argument("--fmt", choices=["PNG", "JPEG"], default="PNG")
+    parser.add_argument("--jpeg-q", type=int, default=95)
+    parser.add_argument("--width", type=int, default=None)
+    parser.add_argument("--height", type=int, default=None)
     args = parser.parse_args(argv)
 
-    try:
-        cfg_data = load_config(args.config)
-        config = ProcessingConfig()
+    cfg = ProcessingConfig(
+        remove_bg=args.remove_bg,
+        remove_wm=args.remove_wm,
+        wm_threshold=args.wm_threshold,
+        wm_radius=args.wm_radius,
+        fmt=args.fmt,
+        jpeg_q=args.jpeg_q,
+        target_width=args.width,
+        target_height=args.height,
+        inp=Path(args.input).expanduser().resolve()
+    )
+    if args.output:
+        cfg.outp = Path(args.output).expanduser().resolve()
+    else:
+        cfg.outp = choose_output_folder_cli(str(cfg.inp))
 
-        config.inp = Path(args.input).expanduser().resolve()
-        if args.output:
-            config.outp = Path(args.output).expanduser().resolve()
-        else:
-            config.outp = choose_output_folder(str(config.inp), use_streamlit_ui=False)
+    logger.info("Начало обработки: %s -> %s", cfg.inp, cfg.outp)
+    logs = process_batch(str(cfg.inp), str(cfg.outp), cfg)
+    for L in logs:
+        print(L)
+    logger.info("Готово. Результаты в: %s", cfg.outp)
 
-        config.remove_bg = args.remove_bg
-        config.remove_wm = args.remove_wm
-        config.wm_threshold = args.wm_threshold
-        config.wm_radius = args.wm_radius
-        config.fmt = args.fmt
-        config.jpeg_q = args.jpeg_q
-        config.target_width = args.width
-        config.target_height = args.height
-
-        save_config({
-            "input_dir": str(config.inp),
-            "output_dir": str(config.outp),
-            "remove_bg": config.remove_bg,
-            "remove_wm": config.remove_wm,
-            "wm_threshold": config.wm_threshold,
-            "wm_radius": config.wm_radius,
-            "fmt": config.fmt,
-            "jpeg_q": config.jpeg_q,
-            "target_width": config.target_width,
-            "target_height": config.target_height
-        }, args.config)
-
-        logger.info(f"Начало обработки: {config.inp} → {config.outp}")
-        logs = process_batch(
-            str(config.inp), str(config.outp), config, selected_filenames=None, uploaded_files=None
-        )
-        for log in logs:
-            print(log)
-        logger.info("Обработка завершена.")
-    except KeyboardInterrupt:
-        logger.warning("Прервано пользователем.")
-        sys.exit(1)
-    except Exception:
-        logger.exception("Неожиданная ошибка в CLI")
-        sys.exit(1)
-
-# --- Streamlit UI ---
 def run_streamlit():
     if not HAS_STREAMLIT:
-        print("Streamlit не установлен. Установите: pip install streamlit")
+        print("Streamlit не установлен.")
         return
-
-    st.set_page_config(page_title="Photo Processor Pro", layout="wide")
+    st.set_page_config(title="Photo Processor Pro", layout="wide")
     st.title("🖼️ Photo Processor Pro")
 
-    # Боковая панель настроек
     with st.sidebar:
-        st.header("Настройки обработки")
+        st.header("Настройки")
         remove_bg = st.checkbox("Удалить фон", value=True)
         remove_wm = st.checkbox("Удалить водяные знаки", value=False)
-        wm_threshold = st.slider("Порог для водяных знаков", 0, 255, 220)
+        wm_threshold = st.slider("Порог WM", 0, 255, 220)
         wm_radius = st.slider("Радиус inpaint", 1, 20, 5)
-        fmt = st.selectbox("Формат вывода", ["PNG", "JPEG"])
+        fmt = st.selectbox("Формат", ["PNG", "JPEG"])
         jpeg_q = st.slider("Качество JPEG", 1, 100, 95) if fmt == "JPEG" else 95
-        target_width = st.number_input("Ширина (px, 0 = авто)", min_value=0, max_value=10000, value=0, step=1)
-        target_height = st.number_input("Высота (px, 0 = авто)", min_value=0, max_value=10000, value=0, step=1)
+        target_width = st.number_input("Ширина (0 = авто)", min_value=0, max_value=10000, value=0)
+        target_height = st.number_input("Высота (0 = авто)", min_value=0, max_value=10000, value=0)
 
-    st.subheader("1. Загрузка изображений")
-    ext_list = [e.lstrip(".") for e in SUPPORTED_EXTENSIONS]
-    uploaded_files = st.file_uploader(
-        "Выберите изображения",
-        accept_multiple_files=True,
-        type=ext_list
-    )
-
-    if uploaded_files:
-        st.subheader("2. Предварительный просмотр")
+    uploaded = st.file_uploader("Выберите изображения", accept_multiple_files=True,
+                                type=[e.lstrip(".") for e in SUPPORTED_EXTENSIONS])
+    if uploaded:
         cols = st.columns(5)
-        for idx, file in enumerate(uploaded_files[:10]):
-            with cols[idx % 5]:
+        for i, f in enumerate(uploaded[:10]):
+            with cols[i % 5]:
                 try:
-                    img = Image.open(file).convert("RGBA")
-                    st.image(img, caption=file.name, use_column_width=True)
+                    st.image(Image.open(f), caption=f.name, use_column_width=True)
                 except Exception:
-                    st.write("❌ Не удалось отобразить")
+                    st.write("Не удалось отобразить")
 
         if st.button("Начать обработку"):
+            tw = target_width or None
+            th = target_height or None
+            temp_dir = Path(tempfile.mkdtemp(prefix="ppp_"))
+            for f in uploaded:
+                (temp_dir / f.name).write_bytes(f.read())
+            out_dir = Path(tempfile.mkdtemp(prefix="ppp_out_"))
+            cfg = ProcessingConfig(remove_bg=remove_bg, remove_wm=remove_wm,
+                                   wm_threshold=wm_threshold, wm_radius=wm_radius,
+                                   fmt=fmt, jpeg_q=jpeg_q, target_width=tw, target_height=th,
+                                   inp=temp_dir, outp=out_dir)
             with st.spinner("Обработка..."):
-                tw = target_width if target_width > 0 else None
-                th = target_height if target_height > 0 else None
-                config = ProcessingConfig(
-                    remove_bg=remove_bg,
-                    remove_wm=remove_wm,
-                    wm_threshold=wm_threshold,
-                    wm_radius=wm_radius,
-                    fmt=fmt,
-                    jpeg_q=jpeg_q,
-                    target_width=tw,
-                    target_height=th,
-                    inp=Path("./temp_uploaded"),
-                    outp=Path("./streamlit_output")
-                )
+                logs = process_batch(str(temp_dir), str(out_dir), cfg)
+            st.subheader("Результаты")
+            for L in logs:
+                if "✅" in L:
+                    st.success(L)
+                elif "❌" in L:
+                    st.error(L)
+                else:
+                    st.info(L)
+            try:
+                zip_path = create_zip_of_output(str(out_dir))
+                with open(zip_path, "rb") as fh:
+                    st.download_button("Скачать ZIP-архив", data=fh, file_name=zip_path.name, mime="application/zip")
+            except Exception as e:
+                st.error(f"Не удалось создать архив: {e}")
 
-                temp_dir = Path("./temp_uploaded")
-                temp_dir.mkdir(exist_ok=True)
-                # Save uploaded files to temp dir (so processing can read from disk if needed)
-                for file in uploaded_files:
-                    data = file.read()
-                    (temp_dir / file.name).write_bytes(data)
-
-                logs = process_batch(
-                    str(temp_dir), str(config.outp), config, uploaded_files=None, selected_filenames=None
-                )
-
-                st.subheader("Результаты")
-                for log in logs:
-                    if "✅" in log:
-                        st.success(log)
-                    elif "❌" in log:
-                        st.error(log)
-                    else:
-                        st.info(log)
-
-                # Создать и предложить скачать ZIP
-                try:
-                    zip_path = create_zip_of_output(str(config.outp))
-                    with open(zip_path, "rb") as f:
-                        st.download_button(
-                            label="Скачать ZIP-архив",
-                            data=f,
-                            file_name=zip_path.name,
-                            mime="application/zip"
-                        )
-                except Exception as e:
-                    st.error(f"Не удалось создать архив: {e}")
-
-# --- Точка входа ---
 def main():
-    parser = argparse.ArgumentParser(description="Photo Processor Pro")
-    parser.add_argument("--mode", choices=["cli", "streamlit"], default="cli",
-                        help="Режим работы (cli или streamlit)")
-    args = parser.parse_args()
-
-    if args.mode == "streamlit":
-        if not HAS_STREAMLIT:
-            print("Ошибка: Streamlit не установлен. Установите через `pip install streamlit`")
-            sys.exit(1)
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--mode", choices=["cli", "streamlit"], default="cli")
+    ns, _ = parser.parse_known_args()
+    if ns.mode == "streamlit":
         run_streamlit()
     else:
         run_cli()
