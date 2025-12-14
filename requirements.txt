@@ -1,13 +1,6 @@
-# Minimal, pinned recommended versions
-pillow==9.5.0
-numpy==1.26.0
-opencv-python-headless==4.8.1.78
-tqdm==4.65.0
-
-# Optional for background removal (install if you need rembg)
-rembg==0.3.6
-onnxruntime==1.15.1
-
-# Optional UI
-streamlit==1.26.0
-Show less
+streamlit>=1.38.0
+rembg>=2.1.0
+opencv-python>=4.9.0
+numpy>=1.24.0
+Pillow>=10.0.0
+pathlib>=1.0.1
