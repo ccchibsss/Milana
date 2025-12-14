@@ -6,6 +6,6 @@ rembg==2.0.69
 pygments==2.19.2
 markdown-it-py==4.0.0
 mdurl==0.1.2
-rich==14.2.0
+rich==13.5.1  # Приведено в соответствие с требованиями Streamlit
 setuptools
 wheel
