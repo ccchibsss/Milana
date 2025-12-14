@@ -1,5 +1,14 @@
-streamlit==1.27.2
-Pillow==9.4.0
-rembg==2.0.0
-opencv-python-headless==4.8.0.74
-numpy==1.23.5
+# Requirements for Photo Processor Pro
+# Основные зависимости
+streamlit>=1.20
+rembg>=2.0.0
+onnxruntime>=1.14.0         # или onnxruntime-gpu для GPU (замените при необходимости)
+opencv-python-headless>=4.7.0
+numpy>=1.23
+Pillow>=9.0
+
+# Примечание:
+# - Если используете GPU для rembg, установите onnxruntime-gpu вместо
+# onnxruntime.
+# - При проблемах с opencv на локальной машине можно заменить
+# opencv-python-headless на opencv-python.
