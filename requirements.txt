@@ -1,5 +1,11 @@
 streamlit==1.27.2
-rembg==3.0.1
-Pillow==10.0.1
+Pillow==10.1.0
 numpy==1.25.2
-opencv-python-headless==4.8.0.76
+opencv-python-headless==4.8.1
+rembg==2.0.69
+pygments==2.19.2
+markdown-it-py==4.0.0
+mdurl==0.1.2
+rich==14.2.0
+setuptools
+wheel
