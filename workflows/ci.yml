@@ -16,10 +16,10 @@ jobs:
       - name: Checkout репозитория
         uses: actions/checkout@v2
 
-      - name: Установка Python 3.10
+      - name: Установка Python 3.11
         uses: actions/setup-python@v2
         with:
-          python-version: '3.10'
+          python-version: '3.11'
 
       - name: Обновление pip, setuptools, wheel
         run: |
@@ -32,7 +32,6 @@ jobs:
       - name: Проверка версии Python
         run: python --version
 
-      - name: Запуск вашего скрипта или тестов
+      - name: Запуск приложения или тестов
         run: |
-          # например, запуск вашего приложения или тестов
           python streamlit_app.py
