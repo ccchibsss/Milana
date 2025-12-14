@@ -1,6 +1,6 @@
-streamlit>=1.38.0
-rembg==2.0.69  # или удалите эту строку
-rich>=10.14.0
-opencv-python-headless
-Pillow
-numpy
+streamlit==1.23.1
+pillow==9.4.0
+rembg==3.0.44
+opencv-python==4.8.0.74
+numpy==1.25.1
+pyttsx3==2.90
