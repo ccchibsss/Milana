@@ -78,7 +78,27 @@ class ProcessingConfig:
     inp: Path = Path("./input")
     outp: Path = Path("./output")
 
-# Анализ изображений для автоматической настройки
+
+# --- Функции загрузки и сохранения конфигурации ---
+def load_config(path: Path = Path("config.json")) -> ProcessingConfig:
+    cfg = ProcessingConfig()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for k, v in data.items():
+                if hasattr(cfg, k):
+                    if k in ("inp", "outp") and v is not None:
+                        setattr(cfg, k, Path(v))
+                    else:
+                        setattr(cfg, k, v)
+        except Exception as e:
+            logger.warning("Не удалось прочесть %s: %s", path, e)
+    return cfg
+
+def save_params(params: WatermarkParams, filename: str):
+    with open(filename, "w", encoding="utf-8") as f:
+        json.dump(params.__dict__, f)
+
 def analyze_image_for_params(pil_img: Image.Image) -> WatermarkParams:
     rgb = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
@@ -97,10 +117,11 @@ def analyze_image_for_params(pil_img: Image.Image) -> WatermarkParams:
         use_ns=True
     )
 
-# Детекция водяных знаков
+# --- Детекция водяных знаков ---
 def detect_watermark_auto(pil_img: Image.Image, params: WatermarkParams) -> np.ndarray:
     rgb = np.array(pil_img.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
     if params.adaptive:
         thr = cv2.adaptiveThreshold(
             gray, 255,
@@ -111,11 +132,14 @@ def detect_watermark_auto(pil_img: Image.Image, params: WatermarkParams) -> np.n
         )
     else:
         _, thr = cv2.threshold(gray, int(params.threshold), 255, cv2.THRESH_BINARY)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
     thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=2)
     thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
+
     contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(gray)
+
     for c in contours:
         area = cv2.contourArea(c)
         if area < params.min_area or area > params.max_area:
@@ -132,9 +156,10 @@ def detect_watermark_auto(pil_img: Image.Image, params: WatermarkParams) -> np.n
         if contrast < 15:
             continue
         cv2.drawContours(mask, [c], -1, 255, -1)
+
     return mask
 
-# Основная функция детекции с автоматической настройкой
+# --- Основная функция автоматической детекции ---
 def detect_watermark(pil_img: Image.Image, auto_mode=True, user_params: Optional[WatermarkParams]=None) -> np.ndarray:
     if auto_mode:
         params = analyze_image_for_params(pil_img)
@@ -142,19 +167,7 @@ def detect_watermark(pil_img: Image.Image, auto_mode=True, user_params: Optional
         params = user_params or WatermarkParams()
     return detect_watermark_auto(pil_img, params)
 
-# Сохранение и загрузка параметров
-def save_params(params: WatermarkParams, filename: str):
-    with open(filename, "w", encoding="utf-8") as f:
-        json.dump(params.__dict__, f)
-
-def load_params(filename: str) -> WatermarkParams:
-    if not Path(filename).exists():
-        return WatermarkParams()
-    with open(filename, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return WatermarkParams(**data)
-
-# Основная обработка водяных знаков
+# --- Основная обработка водяных знаков ---
 def remove_watermark(img_cv: np.ndarray, cfg: ProcessingConfig) -> np.ndarray:
     if not cfg.remove_wm:
         return img_cv
@@ -194,24 +207,27 @@ def remove_watermark(img_cv: np.ndarray, cfg: ProcessingConfig) -> np.ndarray:
             cv2.drawContours(mask, [c], -1, 255, -1)
         if np.sum(mask) == 0:
             return img_cv
+        # Двойной inpaint
         inpainted_telea = cv2.inpaint(bgr, mask, int(cfg.wm_params.radius), cv2.INPAINT_TELEA)
         if cfg.wm_params.use_ns:
             inpainted_ns = cv2.inpaint(bgr, mask, int(cfg.wm_params.radius), cv2.INPAINT_NS)
-            # можно сравнить или оставить Telea
+            # Можно сравнить или выбрать лучший
+            # Для простоты оставим Telea
             inpainted = inpainted_telea
         else:
             inpainted = inpainted_telea
+        # Восстановление альфа-канала
         if img_cv.shape[2] == 4:
             out = cv2.cvtColor(inpainted, cv2.COLOR_BGR2BGRA)
             out[..., 3] = img_cv[..., 3]
         else:
             out = inpainted
         return out
-    except Exception as e:
-        logger.exception("remove_watermark error: %s", e)
+    except Exception:
+        logger.exception("remove_watermark error")
         return img_cv
 
-# Вспомогательные функции
+# --- Вспомогательные функции ---
 def resize_cv(img_cv: np.ndarray, w_target: Optional[int], h_target: Optional[int]) -> np.ndarray:
     h, w = img_cv.shape[:2]
     if not w_target and not h_target:
@@ -243,8 +259,8 @@ def save_cv_image(img_cv: np.ndarray, out_path: Path, cfg: ProcessingConfig) -> 
         else:
             pil.save(out_path, fmt)
         return True
-    except Exception as e:
-        logger.error("Failed to save %s: %s", out_path, e)
+    except Exception:
+        logger.exception("Failed to save %s", out_path)
         return False
 
 def process_image(in_path: Path, out_path: Path, cfg: ProcessingConfig) -> Tuple[bool, str]:
@@ -258,18 +274,27 @@ def process_image(in_path: Path, out_path: Path, cfg: ProcessingConfig) -> Tuple
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
         elif img_cv.shape[2] == 4:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGBA2BGRA)
+        # Обработка водяных знаков
         img_cv = remove_watermark(img_cv, cfg)
+        # Название файла
         out_final = out_path.with_suffix("." + cfg.fmt.lower())
         if save_cv_image(img_cv, out_final, cfg):
             return True, ""
         return False, f"Error saving {out_final}"
     except UnidentifiedImageError:
         return False, f"Unidentified image: {in_path.name}"
-    except Exception as e:
-        logger.exception("Error processing %s: %s", in_path, e)
+    except Exception:
+        logger.exception("Error processing %s", in_path)
         return False, str(e)
 
-# Batch processing
+# --- Вспомогательные функции ---
+def ensure_dir(path: Path):
+    path.mkdir(parents=True, exist_ok=True)
+
+def validate_ext(p: Path) -> bool:
+    return p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+
+# --- Batch processing ---
 def process_batch(input_dir: Path, output_dir: Path, cfg: ProcessingConfig, max_workers: int=4):
     ensure_dir(input_dir)
     ensure_dir(output_dir)
@@ -282,12 +307,9 @@ def process_batch(input_dir: Path, output_dir: Path, cfg: ProcessingConfig, max_
             try:
                 ok, msg = f.result()
                 results.append((p, ok, msg))
-            except Exception as e:
-                results.append((p, False, str(e)))
+            except Exception:
+                results.append((p, False, "Ошибка при обработке"))
     return results
-
-def validate_ext(p: Path) -> bool:
-    return p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
 def zip_results(out_dir: Path, results: List[Tuple[Path, bool, str]], format_ext: str) -> bytes:
     buf = io.BytesIO()
@@ -302,7 +324,7 @@ def zip_results(out_dir: Path, results: List[Tuple[Path, bool, str]], format_ext
     buf.seek(0)
     return buf.read()
 
-# --- CLI ---
+# --- Основной CLI ---
 def run_cli(argv=None):
     parser = argparse.ArgumentParser(description="Photo Processor Pro CLI")
     parser.add_argument("--input", type=Path, required=True, help="Входная папка")
@@ -314,7 +336,7 @@ def run_cli(argv=None):
     parser.add_argument("--workers", type=int, default=4, help="Потоки")
     args = parser.parse_args(argv)
 
-    cfg = ProcessingConfig()
+    cfg = load_config()
     cfg.inp = args.input
     cfg.outp = args.output
     if args.remove_bg:
@@ -335,7 +357,7 @@ def run_cli(argv=None):
         return
 
     # Используем сохранённые параметры
-    wm_params = load_params(args.params_file)
+    wm_params = load_params(Path(args.params_file))
     cfg.wm_params = wm_params
 
     # Обработка
@@ -343,7 +365,7 @@ def run_cli(argv=None):
     for p, ok, msg in results:
         print(f"{'✓' if ok else '✗'} {p.name}: {msg}")
 
-# --- Streamlit ---
+# --- Streamlit UI ---
 def run_streamlit():
     if st is None:
         raise RuntimeError("Streamlit не установлен")
@@ -351,8 +373,9 @@ def run_streamlit():
 
     st.title("Photo Processor Pro — обработка изображений")
     st.sidebar.header("Настройки")
-    inp_dir = Path(st.sidebar.text_input("Входная папка", str(cfg.inp)))
-    out_dir = Path(st.sidebar.text_input("Выходная папка", str(cfg.outp)))
+    inp_dir_str = st.sidebar.text_input("Входная папка", str(cfg.inp))
+    out_dir_str = st.sidebar.text_input("Выходная папка", str(cfg.outp))
+
     remove_bg = st.sidebar.checkbox("Удалить фон", value=cfg.remove_bg)
     remove_wm = st.sidebar.checkbox("Удалить водяные знаки", value=cfg.remove_wm)
     wm_adaptive = st.sidebar.checkbox("Адаптивный порог", value=cfg.wm_params.adaptive)
@@ -362,7 +385,7 @@ def run_streamlit():
     wm_max_area = st.sidebar.number_input("Макс. площадь водяного знака", value=cfg.wm_params.max_area, min_value=1)
     wm_radius = st.sidebar.number_input("Радиус inpaint", value=cfg.wm_params.radius, min_value=1)
     wm_use_ns = st.sidebar.checkbox("Использовать inpaint NS", value=cfg.wm_params.use_ns)
-    fmt = st.sidebar.selectbox("Формат", ["PNG", "JPEG", "BMP"], index=["PNG","JPEG","BMP"].index(cfg.fmt))
+    fmt = st.sidebar.selectbox("Формат", ["PNG", "JPEG", "BMP"], index=["PNG", "JPEG", "BMP"].index(cfg.fmt))
     jpeg_q = st.sidebar.slider("Качество JPEG", 0, 100, cfg.jpeg_q)
     tw = st.sidebar.number_input("Ширина", value=int(cfg.target_width or 0))
     th = st.sidebar.number_input("Высота", value=int(cfg.target_height or 0))
@@ -377,10 +400,11 @@ def run_streamlit():
         st.sidebar.success(f"Загружено {len(uploaded_files)} файлов в {temp_dir}")
 
     use_uploaded = st.sidebar.checkbox("Использовать загруженные файлы", value=bool(uploaded_files))
-    input_dir = Path(inp_dir) if not use_uploaded else (temp_dir or Path("."))
-    output_dir = Path(out_dir)
+    input_dir = Path(inp_dir_str) if not use_uploaded else (temp_dir or Path("."))
+    output_dir = Path(out_dir_str)
 
     if st.button("Начать обработку"):
+        # Создаем локальную копию cfg с новыми параметрами
         cfg_local = ProcessingConfig(
             remove_bg=remove_bg,
             remove_wm=remove_wm,
@@ -421,6 +445,7 @@ def run_streamlit():
                     except:
                         pass
 
+    # Очистка временных файлов
     if temp_dir and temp_dir.exists():
         shutil.rmtree(temp_dir)
 
