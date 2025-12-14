@@ -1,11 +1,11 @@
 streamlit==1.27.2
 Pillow==10.1.0
 numpy==1.25.2
-opencv-python-headless==4.9.1  # Новая версия для Python 3.13
+opencv-python==4.9.1  # Обычная версия OpenCV
 rembg==2.0.69
 pygments==2.19.2
 markdown-it-py==4.0.0
 mdurl==0.1.2
-rich==13.5.1  # Совместимый с Streamlit
+rich==13.5.1  # Корректная версия Rich
 setuptools
 wheel
