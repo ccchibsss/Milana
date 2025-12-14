@@ -1,138 +1,68 @@
+# !/usr/bin/env python3
 """
-Исправленный Photo Processor Pro — полный скрипт с интерактивным выбором файлов из папок.
+Photo Processor Pro — полный скрипт со «меню» и боковой панелью (Streamlit).
+Добавлена гибкая настройка куда сохранять обработанные файлы:
+- В отдельную выходную папку (по умолчанию)
+- Рядом с оригиналом (с суффиксом)
+- В выходную папку с зеркальной структурой входных папок
+Поддерживает CLI-режим, если streamlit не установлен.
 
-Поправлено/добавлено:
-- не вызывать SystemExit при отсутствии --input; по умолчанию используется текущая папка;
-- корректная обработка --create-test (создаёт тесты и продолжает работу);
-- правильная интерпретация workers (0/1 = последовательная);
-- общие устойчивые проверки наличия пакетов/модулей;
-- небольшие защитные фиксы при отсутствии cv2/rembg/tqdm;
-- возможность интерактивно выбирать файлы из указанных папок (--pick-files). В неинтерактивном режиме
-  --pick-files автоматически выбирает все файлы в папках.
+
 """
+
 from pathlib import Path
-from datetime import datetime
-import argparse, logging, sys, os, csv, html, time, traceback, re
+@@ -17,7 +15,7 @@
+import traceback
+import argparse
 from io import BytesIO
-from typing import List, Optional, Dict, Any, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Optional
 
-try:
-    import cv2
-except Exception:
-    cv2 = None
+import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageColor, UnidentifiedImageError
+@@ -87,20 +85,59 @@ def get_image_files_from_dirs(dirs: List[Path], recursive: bool=False) -> List[P
+                    found.append(f)
+    return sorted(set(found), key=lambda p: p.as_posix())
 
-try:
-    from tqdm import tqdm
-except Exception:
-    tqdm = None
-
-try:
-    from rembg import remove as rembg_remove  # type: ignore
-    REMBG_AVAILABLE = True
-except Exception:
-    rembg_remove = None
-    REMBG_AVAILABLE = False
-
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-
-# ---------------- utils -----------------------------------------------------
-def _write_marker_file(folder: Path, text: Optional[str] = None) -> None:
-    try:
-        folder.mkdir(parents=True, exist_ok=True)
-        t = text or f"Photo Processor Pro\nCreated: {datetime.now().isoformat(sep=' ', timespec='seconds')}\n"
-        (folder / "README.txt").write_text(t, encoding="utf-8")
-    except Exception:
-        pass
-
-def setup_logger(out_dir: Optional[Path] = None, level=logging.INFO) -> logging.Logger:
-    logger = logging.getLogger("ppp")
-    logger.setLevel(level)
-    if logger.handlers:
-        return logger
-    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
-    sh = logging.StreamHandler(sys.stdout); sh.setFormatter(fmt); logger.addHandler(sh)
-    if out_dir:
+def find_input_root_for_path(p: Path, input_dirs: List[Path]) -> Optional[Path]:
+    """Вернуть тот входной корень, которому принадлежит p (или ближайший ancestor)."""
+    p_resolved = p.resolve()
+    for root in sorted(input_dirs, key=lambda r: len(str(r)), reverse=True):
         try:
-            out_dir.mkdir(parents=True, exist_ok=True)
-            logfile = out_dir / f"ppp_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-            fh = logging.FileHandler(logfile, encoding="utf-8"); fh.setFormatter(fmt); logger.addHandler(fh)
-        except Exception as e:
-            logger.warning("Не удалось создать файл лога в %s: %s. Используется консоль.", out_dir, e)
-    return logger
-
-def list_images_in_dirs(dirs: List[Path], recursive: bool = False) -> List[Path]:
-    """Accepts paths that may be files or directories. Returns list of image files."""
-    out = []
-    for d in dirs:
-        try:
-            if d.exists() and d.is_file() and d.suffix.lower() in IMG_EXTS:
-                out.append(d)
-                continue
-            if not d.exists() or not d.is_dir():
-                continue
-            it = d.rglob("*") if recursive else d.iterdir()
-            for p in it:
-                try:
-                    if p.is_file() and p.suffix.lower() in IMG_EXTS:
-                        out.append(p)
-                except Exception:
-                    continue
+            if p_resolved.is_relative_to(root.resolve()):  # Python 3.9+
+                return root
         except Exception:
-            continue
-    return sorted(out, key=lambda p: p.as_posix())
+            # fallback for older versions
+            try:
+                p_resolved.relative_to(root.resolve())
+                return root
+            except Exception:
+                continue
+    return None
 
-def compute_output_base(original: Path, out_root: Path, mode: str, input_roots: List[Path], suffix: str = "_proc") -> Path:
-    if mode == "inplace":
+def compute_output_path(original: Path, out_root: Path, save_mode: str,
+                        input_roots: List[Path], suffix: str = "_proc") -> Path:
+    """
+    save_mode:
+      - "out" — все в out_root
+      - "inplace" — рядом с оригиналом, имя + suffix
+      - "mirror" — в out_root с зеркальной структурой относительно одного из input_roots
+    Возвращает Path без расширения (функция save_image добавит расширение).
+    """
+    if save_mode == "inplace":
         return original.parent / f"{original.stem}{suffix}"
-    if mode == "mirror":
-        try:
-            p_res = original.resolve()
-            roots = sorted((r.resolve() for r in input_roots), key=lambda r: len(str(r)), reverse=True)
-            for r in roots:
-                try:
-                    if hasattr(p_res, "is_relative_to") and p_res.is_relative_to(r):
-                        rel = original.relative_to(r)
-                        return out_root / rel.parent / original.stem
-                except Exception:
-                    continue
-        except Exception:
-            pass
+    if save_mode == "mirror":
+        root = find_input_root_for_path(original, input_roots)
+        if root:
+            try:
+                rel = original.relative_to(root)
+                target_dir = out_root / rel.parent
+                return target_dir / original.stem
+            except Exception:
+                pass
+        # fallback to flat out_root
         return out_root / original.stem
+    # default "out"
     return out_root / original.stem
-
-# ---------------- image helpers ---------------------------------------------
-def pil_to_cv(img_pil: Image.Image) -> np.ndarray:
-    arr = np.array(img_pil)
-    if img_pil.mode == "RGBA":
-        if cv2 is None:
-            return arr
-        return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGRA)
-    else:
-        rgb = img_pil.convert("RGB")
-        if cv2 is None:
-            return np.array(rgb)
-        return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
-
-def cv_to_pil(img_cv: np.ndarray) -> Image.Image:
-    if img_cv is None:
-        return Image.new("RGBA", (1,1), (255,255,255,255))
-    if isinstance(img_cv, np.ndarray):
-        if img_cv.ndim == 2:
-            return Image.fromarray(img_cv)
-        if img_cv.shape[2] == 4:
-            if cv2 is None:
-                return Image.fromarray(img_cv)
-            arr = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2RGBA)
-            return Image.fromarray(arr)
-        if cv2 is None:
-            return Image.fromarray(img_cv)
-        arr = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
-        return Image.fromarray(arr)
-    # fallback
-    return Image.fromarray(np.array(img_cv))
 
 def remove_background_pil(img_pil: Image.Image) -> Image.Image:
     if REMBG_AVAILABLE and rembg_remove is not None:
@@ -140,455 +70,214 @@ def remove_background_pil(img_pil: Image.Image) -> Image.Image:
             out = rembg_remove(img_pil)
             if isinstance(out, Image.Image):
                 return out.convert("RGBA")
+
             try:
                 return Image.open(BytesIO(out)).convert("RGBA")
             except Exception:
                 return img_pil.convert("RGBA")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"rembg failed, using fallback: {e}")
+
     rgb = img_pil.convert("RGB")
     arr = np.array(rgb)
     thr = 240
-    bg_mask = np.all(arr > thr, axis=2)
-    alpha = (~bg_mask).astype(np.uint8) * 255
-    rgba = np.dstack([arr, alpha])
-    return Image.fromarray(rgba, "RGBA")
-
-def remove_watermark_cv(img_cv: np.ndarray, threshold: int, radius: int) -> np.ndarray:
-    if cv2 is None or img_cv is None:
-        return img_cv
-    if img_cv.ndim == 2:
-        gray = img_cv
-    else:
-        if img_cv.shape[2] == 4:
-            bgr = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2BGR)
-        else:
-            bgr = img_cv
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    _, thresh = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
-    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    mask = np.zeros(img_cv.shape[:2], dtype=np.uint8)
-    for cnt in contours:
-        if cv2.contourArea(cnt) > 30:
-            cv2.drawContours(mask, [cnt], -1, 255, -1)
-    if np.any(mask):
-        to_inpaint = img_cv
-        converted = False
-        if img_cv.ndim == 3 and img_cv.shape[2] == 4:
-            to_inpaint = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2BGR); converted = True
-        inpainted = cv2.inpaint(to_inpaint, mask, radius=radius, flags=cv2.INPAINT_TELEA)
-        if converted:
-            alpha = img_cv[:, :, 3]; inpainted = cv2.cvtColor(inpainted, cv2.COLOR_BGR2BGRA); inpainted[:, :, 3] = alpha
+@@ -140,15 +177,16 @@ def remove_watermark_cv(img_cv: np.ndarray, threshold: int, radius: int) -> np.n
         return inpainted
     return img_cv
 
-def save_cv_image(img_cv: np.ndarray, out_base: Path, fmt: str, jpeg_q: int = 95) -> Path:
-    out_base.parent.mkdir(parents=True, exist_ok=True)
-    if fmt.upper().startswith("PNG"):
-        out_path = out_base.with_suffix(".png")
-        if cv2 is not None and isinstance(img_cv, np.ndarray) and img_cv.ndim == 3 and img_cv.shape[2] == 4:
-            try:
-                cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 9])
-            except Exception:
-                cv_to_pil(img_cv).save(out_path, format="PNG")
-        else:
-            cv_to_pil(img_cv).save(out_path, format="PNG")
+def save_image(img_cv: np.ndarray, out_path_base: Path, fmt: str, jpeg_q: int=95) -> Path:
+    """Сохраняет изображение, возвращает фактический путь файла."""
+    out_path_base.parent.mkdir(parents=True, exist_ok=True)
+    if fmt == "PNG (с альфа)" and img_cv.ndim == 3 and img_cv.shape[2] == 4:
+        out_path = out_path_base.with_suffix(".png")
+        cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 9])
         return out_path
-    else:
-        out_path = out_base.with_suffix(".jpg")
-        pil = cv_to_pil(img_cv).convert("RGB")
-        pil.save(out_path, format="JPEG", quality=jpeg_q, optimize=True)
-        return out_path
+    if img_cv.ndim == 3 and img_cv.shape[2] == 4:
+        img_cv = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2BGR)
+    out_path = out_path_base.with_suffix(".jpg")
+    ok, buf = cv2.imencode(".jpg", img_cv, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
+    if not ok:
+        raise IOError("cv2.imencode failed")
+@@ -173,35 +211,41 @@ def main_streamlit():
+        st.header("Обзор")
+        st.write("Выберите раздел 'Настройки' в боковой панели, чтобы указать папки/файлы.")
+        st.info(f"rembg available: {REMBG_AVAILABLE}")
 
-def create_side_by_side_thumbnail(original_p: Path, processed_cv: Optional[np.ndarray], thumb_path: Path, size: Tuple[int,int]=(320,240)) -> Path:
-    try:
-        with Image.open(original_p) as im_orig:
-            orig_thumb = im_orig.copy(); orig_thumb.thumbnail(size)
-            if processed_cv is not None:
-                pil_proc = cv_to_pil(processed_cv)
-                pil_proc.thumbnail(size)
-                w = orig_thumb.width + pil_proc.width; h = max(orig_thumb.height, pil_proc.height)
-                canvas = Image.new("RGBA", (w, h), (255,255,255,255))
-                canvas.paste(orig_thumb.convert("RGBA"), (0,0))
-                canvas.paste(pil_proc.convert("RGBA"), (orig_thumb.width,0))
-            else:
-                canvas = Image.new("RGBA", (orig_thumb.width*2, orig_thumb.height), (255,255,255,255))
-                canvas.paste(orig_thumb.convert("RGBA"), (0,0))
-            thumb_path.parent.mkdir(parents=True, exist_ok=True)
-            canvas.save(thumb_path, format="PNG")
-            return thumb_path
-    except Exception:
-        thumb_path.parent.mkdir(parents=True, exist_ok=True)
-        Image.new("RGBA", size, (240,240,240,255)).save(thumb_path, format="PNG")
-        return thumb_path
 
-# ---------------- background & caption -------------------------------------
-def _parse_color(col: Optional[str]) -> Tuple[int,int,int]:
-    if not col:
-        return (255,255,255)
-    try:
-        return ImageColor.getrgb(col)
-    except Exception:
-        try:
-            col = col.strip()
-            return ImageColor.getrgb(col)
-        except Exception:
-            return (255,255,255)
+    elif page == "Настройки":
+        st.header("Настройки и выбор файлов")
+        root = st.text_input("Корневая папка (локальная)", value=str(Path.cwd()))
+        root_p = Path(root)
+        folder_options = [str(p) for p in list_subfolders(root_p)]
+        selected = st.multiselect("Выберите папки для поиска изображений", options=folder_options, default=[str(root_p)] if str(root_p) in folder_options else [])
+        recursive = st.checkbox("Рекурсивно искать в подпапках", value=False)
+        uploaded = st.file_uploader("Загрузите файлы (опционально)", accept_multiple_files=True, type=[e.strip(".") for e in IMG_EXTS])
+        st.session_state["selected_folders"] = selected
+        st.session_state["recursive"] = recursive
+        st.session_state["uploaded"] = uploaded
 
-def _load_font(path: Optional[str], size: int):
-    try:
-        if path and Path(path).exists():
-            return ImageFont.truetype(str(path), size=size)
-    except Exception:
-        pass
-    try:
-        return ImageFont.load_default()
-    except Exception:
-        return None
+        st.success("Настройки сохранены в сессии. Перейдите в 'Обработка' для запуска.")
+    elif page == "Обработка":
+        st.header("Запуск обработки")
+        selected = st.session_state.get("selected_folders", [str(Path.cwd())])
+        recursive = st.session_state.get("recursive", False)
+        uploaded = st.session_state.get("uploaded", [])
 
-def _cover_resize(img: Image.Image, target_size: Tuple[int,int]) -> Image.Image:
-    w,h = img.size; tw,th = target_size
-    if w == 0 or h == 0: return Image.new("RGBA", target_size, (255,255,255,255))
-    scale = max(tw/w, th/h); nw, nh = int(round(w*scale)), int(round(h*scale))
-    img2 = img.resize((nw,nh), Image.LANCZOS)
-    left = (nw - tw)//2; top = (nh - th)//2
-    return img2.crop((left, top, left+tw, top+th))
 
-def apply_background_and_caption(img_pil: Image.Image,
-                                 bg_image_path: Optional[Path],
-                                 bg_color: Optional[str],
-                                 caption_text: Optional[str],
-                                 caption_font: Optional[str],
-                                 caption_size: int,
-                                 caption_color: str,
-                                 caption_pos: str,
-                                 caption_outline: int,
-                                 logger: logging.Logger) -> Image.Image:
-    try:
-        src = img_pil.convert("RGBA")
-        tw, th = src.size
-        if bg_image_path and Path(bg_image_path).exists():
-            try:
-                bg = Image.open(bg_image_path).convert("RGBA")
-                bg = _cover_resize(bg, (tw, th))
-            except Exception as e:
-                logger.warning("Не удалось открыть фон %s: %s. Использую цвет.", bg_image_path, e)
-                bg = Image.new("RGBA", (tw, th), _parse_color(bg_color or "#ffffff") + (255,))
-        else:
-            bg = Image.new("RGBA", (tw, th), _parse_color(bg_color or "#ffffff") + (255,))
-        bg.paste(src, ((tw - src.width)//2, (th - src.height)//2), mask=src)
-        if caption_text:
-            draw = ImageDraw.Draw(bg)
-            font = _load_font(caption_font, caption_size or 36) or ImageFont.load_default()
-            text = str(caption_text)
-            w,h = draw.textsize(text, font=font)
-            pos = ((tw - w)//2, th - h - 10)
-            if "," in (caption_pos or ""):
+        st.subheader("Выбор папок / файлов")
+        root = st.text_input("Корневая папка (локальная)", value=str(Path.cwd()))
+        root_p = Path(root)
+        folder_options = [str(p) for p in list_subfolders(root_p)]
+        selected = st.multiselect("Папки для обработки", options=folder_options, default=selected or [str(root_p)])
+        recursive = st.checkbox("Рекурсивно", value=recursive)
+
+        st.subheader("Куда сохранять обработанные файлы?")
+        save_mode = st.selectbox("Режим сохранения", [
+            ("out", "В отдельную выходную папку (по умолчанию)"),
+            ("inplace", "Рядом с оригиналом (добавить суффикс)"),
+            ("mirror", "В выходную папку с зеркальной структурой")
+        ], format_func=lambda x: x[1])[0]  # store keys
+        output_dir = st.text_input("Выходная папка (используется для режимов out/mirror)", value="./output")
+        fname_suffix = st.text_input("Суффикс для inplace (например _proc)", value="_proc")
+
+        st.subheader("Функции обработки")
+        remove_bg = st.checkbox("Удалить фон (rembg или фолбэк)", value=True)
+        remove_wm = st.checkbox("Убрать водяные знаки (OpenCV)", value=False)
+        if remove_wm:
+@@ -213,44 +257,36 @@ def main_streamlit():
+        fmt = st.radio("Формат вывода", ("PNG (с альфа)", "JPEG (без альфа)"))
+        jpeg_q = st.slider("Качество JPEG (%)", 70, 100, 95) if fmt == "JPEG (без альфа)" else 95
+
+        uploaded_local = st.file_uploader("Или загрузите отдельные файлы (опционально)", accept_multiple_files=True, type=[e.strip(".") for e in IMG_EXTS])
+
+
+        if st.button("🚀 Запустить"):
+            dirs = [Path(p) for p in selected]
+            images = get_image_files_from_dirs(dirs, recursive=recursive)
+            mem = []
+            if uploaded_local:
+                for uf in uploaded_local:
+
+
+
+                    try:
+                        b = uf.read()
+                        mem.append({"name": uf.name, "bytes": b})
+
+                    except Exception as e:
+                        logger.error(f"Ошибка чтения загруженного файла {uf.name}: {e}")
+
+
+
+
+            if not images and not mem:
+                st.warning("Нет изображений для обработки.")
+                return
+
+            out_path = Path(output_dir)
+            if save_mode in ("out", "mirror"):
+                ok, msg = validate_paths(dirs[0] if dirs else Path.cwd(), out_path)
+                if not ok:
+                    st.error(msg)
+                    return
+            st.info(f"Найдено {len(images)} файлов на диске и {len(mem)} загруженных файлов.")
+            progress = st.progress(0.0)
+            log_box = st.empty()
+            logs: List[str] = []
+
+            total = len(images) + len(mem)
+            idx = 0
+
+            for p in images:
                 try:
-                    x_str,y_str = caption_pos.split(",",1); pos = (int(x_str.strip()), int(y_str.strip()))
-                except Exception:
-                    pass
-            else:
-                p = (caption_pos or "bottom").lower()
-                if p in ("top","t"): pos = ((tw-w)//2, 10)
-                elif p in ("center","c","middle","m"): pos = ((tw-w)//2, (th-h)//2)
-            fill = _parse_color(caption_color or "#000000")
-            if caption_outline and caption_outline > 0:
-                outline_color = (0,0,0)
-                rng = range(-caption_outline, caption_outline+1)
-                for dx in rng:
-                    for dy in rng:
-                        if dx==0 and dy==0: continue
-                        draw.text((pos[0]+dx, pos[1]+dy), text, font=font, fill=outline_color)
-            draw.text(pos, text, font=font, fill=fill)
-        return bg.convert("RGBA")
-    except Exception as e:
-        logger.error("Ошибка при добавлении фона/надписи: %s", e)
-        return img_pil.convert("RGBA")
+                    with Image.open(p) as pil:
+@@ -259,21 +295,20 @@ def main_streamlit():
+                        img_cv = pil_to_cv(pil)
+                        if remove_wm:
+                            img_cv = remove_watermark_cv(img_cv, wm_threshold, wm_radius)
+                        out_base = compute_output_path(p, out_path, save_mode, dirs, suffix=fname_suffix)
+                        out_file = save_image(img_cv, out_base, fmt, jpeg_q)
+                        msg = f"✅ {idx+1}/{total}: {p.name} → {out_file}"
+                        logs.append(msg)
+                        log_box.code("\n".join(logs[-10:]))
+                        idx += 1
+                except UnidentifiedImageError:
+                    err = f"❌ {idx+1}/{total}: Не удалось открыть {p.name}"
+                    logs.append(err); log_box.code("\n".join(logs[-10:])); logger.error(err); idx += 1
+                except Exception as e:
+                    err = f"❌ {idx+1}/{total}: Ошибка {p.name} — {e}"
+                    logs.append(err); log_box.code("\n".join(logs[-10:])); logger.error(traceback.format_exc()); idx += 1
+                progress.progress(idx / total)
 
-# ---------------- processing task ------------------------------------------
-def process_single(p: Path, out_root: Path, mode: str, input_roots: List[Path], fmt: str, jpeg_q: int,
-                   remove_bg: bool, remove_wm: bool, wm_threshold: int, wm_radius: int,
-                   suffix: str, retries: int, preview_dir: Path,
-                   bg_image: Optional[str], bg_color: Optional[str],
-                   caption_text: Optional[str], caption_font: Optional[str], caption_size: int,
-                   caption_color: str, caption_pos: str, caption_outline: int,
-                   logger: logging.Logger) -> Dict[str, Any]:
-    rec: Dict[str, Any] = {"src": str(p), "name": p.name, "status": "skipped", "out": None, "thumb": None, "error": None, "time": 0.0, "attempts": 0}
-    base_out = compute_output_base(p, out_root, mode, input_roots, suffix)
-    rec["out_base"] = str(base_out)
-    t0 = time.time(); attempt = 0
-    while attempt <= retries:
-        attempt += 1; rec["attempts"] = attempt
-        try:
-            with Image.open(p) as pil:
-                if remove_bg:
-                    pil = remove_background_pil(pil)
+
+            for mf in mem:
+                try:
+                    pil = Image.open(BytesIO(mf["bytes"]))
+@@ -282,23 +317,27 @@ def main_streamlit():
+                    img_cv = pil_to_cv(pil)
+                    if remove_wm:
+                        img_cv = remove_watermark_cv(img_cv, wm_threshold, wm_radius)
+                    # For uploaded files we can't mirror original structure; use out_path or inplace isn't applicable
+                    if save_mode == "inplace":
+                        # save next to current working directory
+                        out_base = Path.cwd() / f"{Path(mf['name']).stem}{fname_suffix}"
+                    else:
+                        out_base = compute_output_path(Path(mf["name"]), out_path, save_mode, dirs, suffix=fname_suffix)
+                    out_file = save_image(img_cv, out_base, fmt, jpeg_q)
+                    msg = f"✅ {idx+1}/{total}: {mf['name']} → {out_file}"
+                    logs.append(msg); log_box.code("\n".join(logs[-10:])); idx += 1
+                except Exception as e:
+                    err = f"❌ {idx+1}/{total}: Ошибка {mf['name']} — {e}"
+                    logs.append(err); log_box.code("\n".join(logs[-10:])); logger.error(traceback.format_exc()); idx += 1
+                progress.progress(idx / total)
+
+            st.success("Обработка завершена")
+
+            st.code("\n".join(logs))
+            st.write("Выходная папка:")
+            try:
+                for f in sorted(Path(output_dir).rglob("*")):
+                    if f.is_file():
+                        st.write(f.relative_to(Path(output_dir)))
+            except Exception:
+                pass
+    else:
+@@ -314,15 +353,17 @@ def main_streamlit():
+# CLI fallback
+def process_cli(input_dirs: List[str], output_dir: str, recursive: bool,
+                remove_bg: bool, remove_wm: bool, wm_threshold: int, wm_radius: int,
+                fmt: str, jpeg_q: int, save_mode: str, suffix: str):
+    dirs = [Path(d) for d in input_dirs]
+    images = get_image_files_from_dirs(dirs, recursive=recursive)
+    if not images:
+        print("Нет изображений для обработки.")
+        return
+    out_path = Path(output_dir)
+    if save_mode in ("out", "mirror"):
+        ok, msg = validate_paths(dirs[0], out_path)
+        if not ok:
+            print("Ошибка путей:", msg); return
+    print(f"REMBG_AVAILABLE={REMBG_AVAILABLE}")
+    logs = []
+    for idx, p in enumerate(images):
+@@ -333,8 +374,9 @@ def process_cli(input_dirs: List[str], output_dir: str, recursive: bool,
                 img_cv = pil_to_cv(pil)
                 if remove_wm:
                     img_cv = remove_watermark_cv(img_cv, wm_threshold, wm_radius)
-                pil2 = cv_to_pil(img_cv).convert("RGBA")
-                if bg_image or bg_color or caption_text:
-                    pil2 = apply_background_and_caption(pil2, Path(bg_image) if bg_image else None, bg_color, caption_text, caption_font, caption_size, caption_color, caption_pos, caption_outline, logger)
-                final_cv = pil_to_cv(pil2)
-                out_file = save_cv_image(final_cv, base_out, fmt, jpeg_q)
-                try:
-                    rel = base_out.relative_to(out_root); rel_thumb = Path("_previews") / rel.with_suffix(".png")
-                except Exception:
-                    rel_thumb = Path("_previews") / (p.parent.name + "_" + p.stem + ".png")
-                thumb_path = preview_dir / rel_thumb
-                create_side_by_side_thumbnail(p, final_cv, thumb_path)
-                rec.update({"status": "ok", "out": str(out_file), "thumb": str(thumb_path)})
-                break
+                out_base = compute_output_path(p, out_path, save_mode, dirs, suffix=suffix)
+                out_file = save_image(img_cv, out_base, fmt, jpeg_q)
+                msg = f"✅ {idx+1}/{len(images)}: {p.name} → {out_file}"
+                logs.append(msg); print(msg)
         except Exception as e:
-            logger.debug("error processing %s attempt %d -> %s", p, attempt, e)
-            rec["error"] = f"{type(e).__name__}: {e}"
-            if attempt > retries:
-                rec["status"] = "error"; break
-            time.sleep(0.5 * attempt)
-    rec["time"] = round(time.time() - t0, 3)
-    return rec
-
-# ---------------- reporting -------------------------------------------------
-def save_csv_report(out_root: Path, records: List[Dict[str,Any]]) -> Path:
-    out_root.mkdir(parents=True, exist_ok=True)
-    csv_path = out_root / "report.csv"
-    fields = ["src","name","status","out","out_base","thumb","error","time","attempts"]
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
-        for r in records: w.writerow({k: r.get(k,"") for k in fields})
-    return csv_path
-
-def save_html_report(out_root: Path, records: List[Dict[str,Any]], title: str="Отчёт Photo Processor Pro") -> Path:
-    out_root.mkdir(parents=True, exist_ok=True); html_path = out_root / "report.html"
-    now = datetime.now().isoformat(sep=" ", timespec="seconds")
-    rows = []
-    for r in records:
-        thumb = r.get("thumb"); thumb_rel = os.path.relpath(thumb, out_root) if thumb else ""
-        outf = r.get("out") or ""; outf_rel = os.path.relpath(outf, out_root) if outf else ""
-        err = html.escape(str(r.get("error") or ""))
-        rows.append(f"<tr><td>{html.escape(r.get('name',''))}</td><td>{r.get('status')}</td><td>{r.get('attempts')}</td><td>{r.get('time')}</td><td>{err}</td><td>{f'<a href=\"{outf_rel}\">файл</a>' if outf_rel else ''}</td><td>{f'<a href=\"{thumb_rel}\"><img src=\"{thumb_rel}\" style=\"max-width:240px\"></a>' if thumb_rel else ''}</td></tr>")
-    html_doc = f"<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:6px}}</style></head><body><h1>{html.escape(title)}</h1><p>Сгенерировано: {now}</p><table><tr><th>имя</th><th>статус</th><th>попытки</th><th>время(с)</th><th>ошибка</th><th>файл</th><th>превью</th></tr>{''.join(rows)}</table></body></html>"
-    html_path.write_text(html_doc, encoding="utf-8"); return html_path
-
-# ---------------- interactive file picker ---------------------------------
-def parse_selection(s: str, n: int) -> List[int]:
-    """Accepts '1,2,5-8' or 'a'/'all' -> 0-based indices"""
-    s = (s or "").strip().lower()
-    if not s: return []
-    if s in ("a", "all"): return list(range(n))
-    parts = re.split(r"[,\s]+", s)
-    idxs = set()
-    for part in parts:
-        if not part: continue
-        if "-" in part:
-            try:
-                a,b = part.split("-",1); ia,ib = int(a)-1,int(b)-1
-                ia = max(0, ia); ib = min(n-1, ib)
-                for i in range(min(ia,ib), max(ia,ib)+1): idxs.add(i)
-            except Exception:
-                continue
-        else:
-            if part.isdigit():
-                i = int(part)-1
-                if 0 <= i < n: idxs.add(i)
-    return sorted(idxs)
-
-def ask_select_files_in_folder(folder: Path, recursive: bool=False) -> List[Path]:
-    if not folder.exists() or not folder.is_dir():
-        return []
-    files = sorted([p for p in (folder.rglob("*") if recursive else folder.iterdir()) if p.is_file() and p.suffix.lower() in IMG_EXTS], key=lambda p: p.name)
-    if not files:
-        print(f"  (no image files in {folder})")
-        return []
-    print(f"\nFiles in {folder}:")
-    for i, f in enumerate(files, 1):
-        print(f"  {i:3d}) {f.name}")
-    print("Select by numbers, ranges or 'a' for all (e.g. '1,3,5-8' ; enter to skip):")
-    try:
-        s = input("Selection: ").strip()
-    except Exception:
-        s = ""
-    if not s:
-        return []
-    idxs = parse_selection(s, len(files))
-    return [files[i] for i in idxs]
-
-# ---------------- CLI / main ------------------------------------------------
-def parse_args():
-    p = argparse.ArgumentParser(description="Photo Processor Pro — полный скрипт")
-    p.add_argument("-i","--input", nargs="+", help="входные папки (укажите минимум одну) или файлы")
-    p.add_argument("-o","--output", default="./output", help="выходная папка")
-    p.add_argument("-r","--recursive", action="store_true", help="искать рекурсивно")
-    p.add_argument("--create-test", action="store_true", help="создать тестовые изображения в первой входной папке")
-    p.add_argument("--pick-files", action="store_true", help="интерактивно выбрать файлы из входных папок (или auto-all в non-tty)")
-    p.add_argument("--no-bg", dest="remove_bg", action="store_false", help="не удалять фон")
-    p.set_defaults(remove_bg=True)
-    p.add_argument("--wm", dest="remove_wm", action="store_true", help="удалять водяные знаки (простой метод)")
-    p.add_argument("--wm-th", type=int, default=220, help="порог маски водяного знака")
-    p.add_argument("--wm-r", type=int, default=5, help="радиус инпейнта")
-    p.add_argument("--fmt", choices=["PNG","JPEG"], default="PNG", help="формат вывода")
-    p.add_argument("--q", type=int, default=95, help="jpeg quality")
-    p.add_argument("--save-mode", choices=["out","inplace","mirror"], default="out", help="режим сохранения")
-    p.add_argument("--suffix", default="_proc", help="суффикс для inplace")
-    p.add_argument("--workers", type=int, default=1, help="параллельные рабочие (0/1=последовательно)")
-    p.add_argument("--dry-run", action="store_true", help="показать куда сохранить и выйти")
-    p.add_argument("--retries", type=int, default=1, help="повторы при ошибке")
-    p.add_argument("--report", action="store_true", help="создать CSV+HTML отчёт")
-    p.add_argument("--bg-image", default=None, help="изображение фона (cover)")
-    p.add_argument("--bg-color", default="#ffffff", help="цвет фона (если нет bg-image)")
-    p.add_argument("--caption", default=None, help="текст подписи")
-    p.add_argument("--caption-font", default=None, help="путь к .ttf шрифту")
-    p.add_argument("--caption-size", type=int, default=36, help="размер шрифта")
-    p.add_argument("--caption-color", default="#000000", help="цвет текста")
-    p.add_argument("--caption-pos", default="bottom", help="позиция текста: top/center/bottom или 'x,y'")
-    p.add_argument("--caption-outline", type=int, default=1, help="толщина обводки текста (px)")
-    return p.parse_args()
-
-def create_test_images(out_dir: Path, count: int = 3):
-    out_dir.mkdir(parents=True, exist_ok=True)
-    created = []
-    for i in range(count):
-        fn = out_dir / f"test_{i+1}.png"
-        im = Image.new("RGB", (800,600), (200,200,200))
-        d = ImageDraw.Draw(im)
-        try:
-            d.text((20,20), f"Test {i+1} {datetime.now().isoformat(timespec='seconds')}", fill=(10,10,10))
-        except Exception:
-            pass
-        im.save(fn); created.append(fn)
-    return created
-
-def main():
-    args = parse_args()
-    input_roots = [Path(x) for x in (args.input or [])]
-    # default to cwd if nothing passed
-    if not input_roots:
-        if args.create_test:
-            target = Path.cwd()
-            create_test_images(target, count=3)
-            input_roots = [target]
-        else:
-            input_roots = [Path.cwd()]
-
-    out_root = Path(args.output)
-    try:
-        out_root.mkdir(parents=True, exist_ok=True)
-        _write_marker_file(out_root, text=f"Photo Processor Pro\nПапка вывода: {out_root}\nСоздана: {datetime.now().isoformat(sep=' ', timespec='seconds')}\n")
-    except Exception:
-        pass
-
-    logger = setup_logger(out_root if not args.dry_run else None)
-    logger.info("Запуск: input=%s output=%s", input_roots, out_root)
-
-    images: List[Path] = []
-    # If pick-files requested -> interactive selection (or auto-all if non-tty)
-    if args.pick_files:
-        logger.info("File picking mode (--pick-files).")
-        if not sys.stdin.isatty():
-            # non-interactive: auto-select all images found
-            images = list_images_in_dirs(input_roots, recursive=args.recursive)
-            if not images:
-                logger.info("No images found in input folders for auto-selection: %s", ", ".join(str(p) for p in input_roots))
-        else:
-            # interactive: ask per folder
-            for d in input_roots:
-                picks = ask_select_files_in_folder(d, recursive=args.recursive)
-                images.extend(picks)
-    else:
-        # default behavior: gather files & dirs (accept files passed directly)
-        images = list_images_in_dirs(input_roots, recursive=args.recursive)
-
-    # if no images and create-test requested -> create tests and re-scan
-    if not images and args.create_test:
-        target = input_roots[0]
-        created = create_test_images(target, count=3)
-        logger.info("Создано тестовых изображений: %d в %s", len(created), target)
-        if args.pick_files and sys.stdin.isatty():
-            for d in input_roots:
-                picks = ask_select_files_in_folder(d, recursive=args.recursive)
-                images.extend(picks)
-        else:
-            images = list_images_in_dirs(input_roots, recursive=args.recursive)
-
-    if not images:
-        logger.info("Изображений не найдено в указанных папках: %s", ", ".join(str(p) for p in input_roots))
-        return
-
-    logger.info("Найдено %d изображений. REMBG_AVAILABLE=%s cv2=%s", len(images), REMBG_AVAILABLE, cv2 is not None)
-    fmt_str = args.fmt.upper()
-    preview_dir = out_root
-
-    if args.dry_run:
-        logger.info("DRY RUN: первые 20 соответствий")
-        for p in images[:20]:
-            base = compute_output_base(p, out_root, args.save_mode, input_roots, args.suffix)
-            logger.info("%s -> base=%s (.png/.jpg)", p, base)
-        return
-
-    records = []
-    total = len(images)
-    workers = args.workers if args.workers and args.workers > 1 else 1
-    use_tqdm = tqdm is not None
-
-    if workers == 1:
-        iterable = images
-        if use_tqdm:
-            iterable = tqdm(images, desc="Обработка", unit="файл")
-        for p in iterable:
-            rec = process_single(p, out_root, args.save_mode, input_roots, fmt_str, args.q,
-                                 args.remove_bg if hasattr(args, "remove_bg") else True,
-                                 args.remove_wm if hasattr(args, "remove_wm") else False,
-                                 args.wm_th, args.wm_r,
-                                 args.suffix, args.retries, preview_dir,
-                                 args.bg_image, args.bg_color, args.caption, args.caption_font, args.caption_size,
-                                 args.caption_color, args.caption_pos, args.caption_outline,
-                                 logger)
-            records.append(rec)
-    else:
-        logger.info("Processing with %d workers...", workers)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = {ex.submit(process_single, p, out_root, args.save_mode, input_roots, fmt_str, args.q,
-                                 args.remove_bg if hasattr(args, "remove_bg") else True,
-                                 args.remove_wm if hasattr(args, "remove_wm") else False,
-                                 args.wm_th, args.wm_r,
-                                 args.suffix, args.retries, preview_dir,
-                                 args.bg_image, args.bg_color, args.caption, args.caption_font, args.caption_size,
-                                 args.caption_color, args.caption_pos, args.caption_outline,
-                                 logger): p for p in images}
-            if use_tqdm:
-                with tqdm(total=total, desc="Обработка", unit="файл") as pbar:
-                    for fut in as_completed(futures):
-                        try:
-                            rec = fut.result()
-                        except Exception:
-                            rec = {"src": str(futures.get(fut, "unknown")), "name": "unknown", "status": "error", "error": traceback.format_exc(), "time": 0, "attempts": 0}
-                            logger.error("Unhandled exception in worker: %s", rec["error"])
-                        records.append(rec); pbar.update(1)
-            else:
-                for fut in as_completed(futures):
-                    try:
-                        rec = fut.result()
-                    except Exception:
-                        rec = {"src": str(futures.get(fut, "unknown")), "name": "unknown", "status": "error", "error": traceback.format_exc(), "time": 0, "attempts": 0}
-                        logger.error("Unhandled exception in worker: %s", rec["error"])
-                    records.append(rec)
-
-    try:
-        (out_root / "_previews").mkdir(parents=True, exist_ok=True)
-        _write_marker_file(out_root / "_previews", text="Превью обработанных файлов.")
-    except Exception:
-        pass
-
-    csv_p = save_csv_report(out_root, records)
-    logger.info("CSV report: %s", csv_p)
-    if args.report:
-        html_p = save_html_report(out_root, records, title="Photo Processor Pro Report")
-        logger.info("HTML report: %s", html_p)
-
-    ok = sum(1 for r in records if r.get("status") == "ok")
-    err = sum(1 for r in records if r.get("status") == "error")
-    logger.info("Done: total=%d ok=%d error=%d", len(records), ok, err)
-
-if __name__ == "__main__":
-    main()
+            err = f"❌ {idx+1}/{len(images)}: {p.name} — {e}"
+@@ -357,7 +399,10 @@ def process_cli(input_dirs: List[str], output_dir: str, recursive: bool,
+        parser.add_argument("--wm-r", type=int, default=5, help="радиус инпейнта")
+        parser.add_argument("--fmt", choices=["PNG", "JPEG"], default="PNG", help="формат вывода")
+        parser.add_argument("--q", type=int, default=95, help="качество JPEG")
+        parser.add_argument("--save-mode", choices=["out", "inplace", "mirror"], default="out",
+                            help="куда сохранять: out (в выходную папку), inplace (рядом, с суффиксом), mirror (зеркальная структура)")
+        parser.add_argument("--suffix", default="_proc", help="суффикс для inplace")
+        args = parser.parse_args()
+        fmt = "PNG (с альфа)" if args.fmt == "PNG" else "JPEG (без альфа)"
+        process_cli(args.input, args.output, args.recursive, args.remove_bg, args.remove_wm,
+                    args.wm_th, args.wm_r, fmt, args.q, args.save_mode, args.suffix)
