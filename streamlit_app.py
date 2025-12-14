@@ -1,13 +1,9 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro (CLI + Streamlit) — полный рабочий скрипт.
-Поддерживает:
-- CLI (необязательные аргументы, берутся из config.json или defaults)
-- Streamlit-интерфейс (если установлен)
-- Удаление фона (rembg или grabcut fallback)
-- Удаление простых водяных знаков
-- Выбор файла, пакетная обработка и скачивание ZIP результатов
+Photo Processor Pro (CLI + Streamlit)
+Добавлена возможность загружать файлы через Streamlit (upload) и кнопка
+скачать все результаты (ZIP). Скрипт работает с CLI, если Streamlit не установлен.
 """
 
 from __future__ import annotations
@@ -17,6 +13,8 @@ import json
 import logging
 import sys
 import zipfile
+import tempfile
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -60,6 +58,7 @@ def setup_logger() -> logging.Logger:
 logger = setup_logger()
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+SUPPORTED_TYPES = [ext.lstrip(".") for ext in SUPPORTED_EXTENSIONS]
 
 
 @dataclass
@@ -77,7 +76,6 @@ class ProcessingConfig:
 
 
 def load_config() -> ProcessingConfig:
-    """Загружает config.json или возвращает дефолтные значения."""
     config_path = Path("config.json")
     if config_path.exists():
         try:
@@ -93,7 +91,6 @@ def load_config() -> ProcessingConfig:
             return cfg
         except Exception as e:
             logger.error("Ошибка чтения config.json: %s", e)
-    logger.info("Используются дефолтные настройки (config.json не найден)")
     return ProcessingConfig()
 
 
@@ -345,112 +342,150 @@ def run_streamlit():
     if st is None:
         raise RuntimeError("Streamlit не доступен")
     st.title("Photo Processor Pro")
-    st.write("Обработка изображений: удаление фона, водяных знаков, изменение размера.")
+    st.write("Удаление фона, удаление водяных знаков, изменение размера. "
+             "Вы можете выбрать папку на сервере или загрузить файлы вручную.")
 
-    config = load_config()
-    input_dir = Path(st.sidebar.text_input("Входная папка", value=str(config.inp)))
-    output_dir = Path(st.sidebar.text_input("Выходная папка", value=str(config.outp)))
+    cfg = load_config()
+    st.sidebar.header("Настройки")
+    input_dir_text = st.sidebar.text_input("Входная папка (сервер)", value=str(cfg.inp))
+    output_dir_text = st.sidebar.text_input("Выходная папка (сервер)", value=str(cfg.outp))
 
-    remove_bg = st.sidebar.checkbox("Удалить фон", value=config.remove_bg)
-    remove_wm = st.sidebar.checkbox("Удалить водяные знаки", value=config.remove_wm)
+    remove_bg = st.sidebar.checkbox("Удалить фон", value=cfg.remove_bg)
+    remove_wm = st.sidebar.checkbox("Удалить водяные знаки", value=cfg.remove_wm)
     fmt = st.sidebar.selectbox("Формат вывода", ["PNG", "JPEG", "BMP"], index=0)
-    jpeg_q = st.sidebar.slider("Качество JPEG (0-100)", 0, 100, int(config.jpeg_q))
-    target_width = st.sidebar.number_input("Ширина (px)", value=int(config.target_width or 0), min_value=0, step=10)
-    target_height = st.sidebar.number_input("Высота (px)", value=int(config.target_height or 0), min_value=0, step=10)
+    jpeg_q = st.sidebar.slider("Качество JPEG (0-100)", 0, 100, int(cfg.jpeg_q))
+    target_width = st.sidebar.number_input("Ширина (px)", value=int(cfg.target_width or 0), min_value=0, step=10)
+    target_height = st.sidebar.number_input("Высота (px)", value=int(cfg.target_height or 0), min_value=0, step=10)
     workers = st.sidebar.number_input("Потоки", value=4, min_value=1, step=1)
 
     st.sidebar.markdown("---")
-    st.sidebar.write("Файлы в входной папке:")
+    st.sidebar.write("Или загрузите файлы прямо сюда:")
+    uploaded = st.sidebar.file_uploader("Загрузить изображения", type=SUPPORTED_TYPES, accept_multiple_files=True)
+
+    # Create temp input dir if uploaded files present
+    temp_input_dir: Optional[Path] = None
+    if uploaded:
+        temp_input_dir = Path(tempfile.mkdtemp(prefix="pp_upload_"))
+        for up in uploaded:
+            target = temp_input_dir / up.name
+            with open(target, "wb") as f:
+                f.write(up.getbuffer())
+        st.sidebar.success(f"Загружено {len(uploaded)} файлов (временная папка: {temp_input_dir})")
+
+    use_uploaded = st.sidebar.checkbox("Использовать загруженные файлы (вместо серверной папки)", value=bool(uploaded))
+
+    input_dir = Path(input_dir_text) if not use_uploaded else (temp_input_dir or Path("."))
+    output_dir = Path(output_dir_text)
+
+    st.write("Файлы в текущей входной папке:")
     if not input_dir.exists() or not input_dir.is_dir():
-        st.sidebar.error("Входная папка не найдена или не каталог")
+        st.error(f"Входная папка не найдена или не каталог: {input_dir}")
         file_list = []
     else:
         file_list = sorted([p for p in input_dir.iterdir() if p.is_file() and validate_file_extension(p)], key=lambda p: p.name)
         if not file_list:
-            st.sidebar.info("Нет изображений в папке")
+            st.info("Входная папка пуста или нет поддерживаемых изображений.")
 
     file_names = [p.name for p in file_list]
-    selected = st.sidebar.selectbox("Выбрать файл для обработки", options=["(выбрать)"] + file_names, index=0)
+    selected_file = st.selectbox("Выбрать файл для одиночной обработки", options=["(ничего)"] + file_names)
 
-    if st.button("Обработать выбранный файл") and selected and selected != "(выбрать)":
-        cfg = ProcessingConfig(**vars(config))
-        cfg.inp = input_dir
-        cfg.outp = output_dir
-        cfg.remove_bg = remove_bg
-        cfg.remove_wm = remove_wm
-        cfg.fmt = fmt
-        cfg.jpeg_q = int(jpeg_q)
-        cfg.target_width = int(target_width) if target_width > 0 else None
-        cfg.target_height = int(target_height) if target_height > 0 else None
+    # Build runtime config
+    run_cfg = ProcessingConfig(
+        remove_bg=remove_bg,
+        remove_wm=remove_wm,
+        wm_threshold=cfg.wm_threshold,
+        wm_radius=cfg.wm_radius,
+        fmt=fmt,
+        jpeg_q=int(jpeg_q),
+        target_width=int(target_width) if target_width > 0 else None,
+        target_height=int(target_height) if target_height > 0 else None,
+        inp=input_dir,
+        outp=output_dir,
+    )
 
-        valid, msg = validate_path(cfg.inp, is_input=True)
-        if not valid:
+    # Single file processing
+    if st.button("Обработать выбранный файл") and selected_file and selected_file != "(ничего)":
+        valid_in, msg = validate_path(run_cfg.inp, is_input=True)
+        valid_out, msg2 = validate_path(run_cfg.outp, is_input=False)
+        if not valid_in:
             st.error(msg)
+        elif not valid_out:
+            st.error(msg2)
         else:
-            valid, msg = validate_path(cfg.outp, is_input=False)
-            if not valid:
-                st.error(msg)
+            in_path = run_cfg.inp / selected_file
+            out_path = run_cfg.outp / f"{in_path.stem}.{run_cfg.fmt.lower()}"
+            st.info(f"Обработка {selected_file} ...")
+            ok, msg = process_image(in_path, out_path, run_cfg)
+            if ok:
+                st.success("Успешно")
+                try:
+                    with open(out_path, "rb") as f:
+                        data = f.read()
+                    st.image(out_path, caption=out_path.name, use_column_width=True)
+                    st.download_button("Скачать результат", data, file_name=out_path.name, mime="application/octet-stream")
+                except Exception as e:
+                    st.error(f"Не удалось отобразить/скачать результат: {e}")
             else:
-                in_path = input_dir / selected
-                out_path = cfg.outp / f"{in_path.stem}.{cfg.fmt.lower()}"
-                st.info(f"Обработка {selected} ...")
-                ok, msg = process_image(in_path, out_path, cfg)
-                if ok and out_path.exists():
-                    st.success("Готово")
-                    try:
-                        with open(out_path, "rb") as f:
-                            data = f.read()
-                        st.image(out_path, caption=out_path.name, use_column_width=True)
-                        st.download_button("Скачать результат", data, file_name=out_path.name, mime="application/octet-stream")
-                    except Exception as e:
-                        st.error(f"Не удалось отобразить/скачать результат: {e}")
-                else:
-                    st.error(f"Ошибка обработки: {msg}")
+                st.error(f"Ошибка: {msg}")
 
-    if st.button("Обработать все и скачать ZIP"):
-        cfg = ProcessingConfig(**vars(config))
-        cfg.inp = input_dir
-        cfg.outp = output_dir
-        cfg.remove_bg = remove_bg
-        cfg.remove_wm = remove_wm
-        cfg.fmt = fmt
-        cfg.jpeg_q = int(jpeg_q)
-        cfg.target_width = int(target_width) if target_width > 0 else None
-        cfg.target_height = int(target_height) if target_height > 0 else None
-
-        valid, msg = validate_path(cfg.inp, is_input=True)
-        if not valid:
+    # Batch processing buttons
+    if st.button("Обработать все (входная папка)"):
+        valid_in, msg = validate_path(run_cfg.inp, is_input=True)
+        valid_out, msg2 = validate_path(run_cfg.outp, is_input=False)
+        if not valid_in:
             st.error(msg)
+        elif not valid_out:
+            st.error(msg2)
         else:
-            valid, msg = validate_path(cfg.outp, is_input=False)
-            if not valid:
-                st.error(msg)
-            else:
-                st.info("Запущена пакетная обработка...")
-                results = process_batch(cfg.inp, cfg.outp, cfg, max_workers=int(workers))
-                success_count = sum(1 for _, ok, _ in results if ok)
-                fail_count = len(results) - success_count
+            st.info("Запущена пакетная обработка...")
+            results = process_batch(run_cfg.inp, run_cfg.outp, run_cfg, max_workers=int(workers))
+            success_count = sum(1 for _, ok, _ in results if ok)
+            fail_count = len(results) - success_count
+            st.write(f"Результаты: успешно {success_count}, ошибок {fail_count}")
+            for p, ok, m in results:
+                if not ok:
+                    st.warning(f"{p.name}: {m}")
+            if success_count > 0:
+                zipdata = _zip_results_bytes(run_cfg.outp, results, run_cfg.fmt)
+                st.download_button("Скачать все результаты (ZIP)", zipdata, file_name=f"results_{run_cfg.fmt.lower()}.zip", mime="application/zip")
 
-                st.write(f"Успешно: {success_count}, Ошибок: {fail_count}")
-                if success_count > 0:
-                    zip_bytes = _zip_results_bytes(cfg.outp, results, cfg.fmt)
-                    st.download_button("Скачать все результаты (ZIP)", zip_bytes, file_name=f"results_{cfg.fmt.lower()}.zip", mime="application/zip")
-                for p, ok, msg in results:
-                    if not ok:
-                        st.warning(f"{p.name}: {msg}")
+    # Process uploaded only (if any)
+    if uploaded and st.button("Обработать загруженные файлы и скачать ZIP"):
+        # ensure output dir exists
+        valid_out, msg_out = validate_path(run_cfg.outp, is_input=False)
+        if not valid_out:
+            st.error(msg_out)
+        else:
+            st.info("Обработка загруженных файлов...")
+            results = process_batch(temp_input_dir, run_cfg.outp, run_cfg, max_workers=int(workers))
+            success_count = sum(1 for _, ok, _ in results if ok)
+            fail_count = len(results) - success_count
+            st.write(f"Обработано: {success_count}, ошибок: {fail_count}")
+            if success_count > 0:
+                zipdata = _zip_results_bytes(run_cfg.outp, results, run_cfg.fmt)
+                st.download_button("Скачать ZIP обработанных загруженных файлов", zipdata,
+                                   file_name=f"uploaded_results_{run_cfg.fmt.lower()}.zip", mime="application/zip")
+            for p, ok, m in results:
+                if not ok:
+                    st.warning(f"{p.name}: {m}")
+        # cleanup temp uploaded folder
+        try:
+            if temp_input_dir and temp_input_dir.exists():
+                shutil.rmtree(temp_input_dir)
+        except Exception:
+            pass
 
     st.markdown("---")
     st.write("Предпросмотр (без обработки)")
-    if selected and selected != "(выбрать)":
+    if selected_file and selected_file != "(ничего)":
         try:
-            img = Image.open(input_dir / selected)
-            st.image(img, caption=f"Исходник: {selected}", use_column_width=True)
+            img = Image.open(input_dir / selected_file)
+            st.image(img, caption=f"Исходник: {selected_file}", use_column_width=True)
         except Exception as e:
-            st.write(f"Не удалось открыть {selected}: {e}")
+            st.write(f"Не удалось открыть {selected_file}: {e}")
 
 
 def main(argv: Optional[List[str]] = None):
-    # Если запускается через streamlit (streamlit imports the module), используем UI
     if HAS_STREAMLIT and "streamlit" in sys.modules:
         run_streamlit()
     else:
