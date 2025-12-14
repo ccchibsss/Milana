@@ -1,10 +1,11 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — исправленная объединённая версия:
-- CLI или Streamlit UI.
-- Выбор входной/выходной папки, удаление фона (rembg/GrabCut), простое удаление водяных знаков (inpaint).
-- Параллельная обработка (ThreadPool), валидация путей и форматов, сохранение конфигурации.
+Photo Processor Pro — полная версия (CLI + Streamlit).
+- CLI: интерактивный выбор выходной папки при необходимости.
+- Streamlit: секции слева и настройки справа, сохранение результатов локально и ZIP для скачивания.
+- Удаление фона (rembg если установлен, иначе GrabCut), простое удаление водяных знаков (inpaint).
+- Параллельная обработка (ThreadPool).
 """
 from pathlib import Path
 from datetime import datetime
@@ -15,6 +16,7 @@ import os
 import sys
 import argparse
 import json
+import shutil
 from typing import List, Optional, Tuple, Dict, Any
 import concurrent.futures as cf
 import multiprocessing as mp
@@ -208,7 +210,7 @@ def remove_watermark_cv(img_cv: np.ndarray, threshold: int = 220, radius: int = 
                 cv2.drawContours(mask, [c], -1, 255, -1)
         if np.any(mask):
             inpainted = cv2.inpaint(bgr, mask, radius, cv2.INPAINT_TELEA)
-            if img_cv.shape[2] == 4:
+            if img_cv.ndim == 3 and img_cv.shape[2] == 4:
                 out = cv2.cvtColor(inpainted, cv2.COLOR_BGR2BGRA)
                 out[..., 3] = img_cv[..., 3]
                 return out
@@ -488,132 +490,218 @@ def run_cli(argv=None):
     )
     print("\n".join(logs))
 
-# --- Streamlit UI ---
+# --- Streamlit UI (sections left, settings right) ---
 def run_streamlit():
     if not HAS_STREAMLIT:
         print("Streamlit не установлен. Установите через `pip install streamlit`.")
         return
 
     st.set_page_config(page_title="Photo Processor Pro", layout="wide")
-    st.title("🖼️ Photo Processor Pro")
+    st.title("🖼️ Photo Processor Pro — настройки (секции слева, параметры справа)")
 
-    with st.sidebar:
-        st.header("Настройки")
-        config_file = st.file_uploader("Загрузить config.json", type=["json"])
-        if config_file:
-            try:
-                cfg = json.load(config_file)
-            except Exception:
-                cfg = {}
-        else:
-            cfg = {}
-        input_dir = st.text_input("Входная папка", value=cfg.get("input_dir", "./input"))
-        output_dir = st.text_input("Выходная папка", value=cfg.get("output_dir", "./output"))
-        remove_bg = st.checkbox("Удалить фон", value=cfg.get("remove_bg", True))
-        remove_wm = st.checkbox("Удалить водяные знаки", value=cfg.get("remove_wm", False))
-        wm_threshold = st.slider("Порог водяных знаков", 0, 255, cfg.get("wm_threshold", 220))
-        wm_radius = st.slider("Радиус inpaint", 1, 20, cfg.get("wm_radius", 5))
-        fmt = st.selectbox("Формат вывода", ["PNG", "JPEG"], index=0 if cfg.get("fmt", "PNG") == "PNG" else 1)
-        jpeg_q = st.slider("Качество JPEG", 1, 100, cfg.get("jpeg_q", 95)) if fmt == "JPEG" else 95
-        st.markdown("---")
-        st.subheader("Изменение размера (необязательно)")
-        resize_mode = st.selectbox("Режим", ("Оригинал", "Ширина", "Высота", "Оба"))
-        target_width = None; target_height = None
-        if resize_mode == "Ширина":
-            target_width = st.number_input("Ширина (px)", min_value=1, value=cfg.get("target_width", 1920))
-        elif resize_mode == "Высота":
-            target_height = st.number_input("Высота (px)", min_value=1, value=cfg.get("target_height", 1080))
-        elif resize_mode == "Оба":
-            target_width = st.number_input("Ширина (px)", min_value=1, value=cfg.get("target_width", 1920))
-            target_height = st.number_input("Высота (px)", min_value=1, value=cfg.get("target_height", 1080))
-        st.markdown("---")
-        st.subheader("Файлы")
-        input_mode = st.radio("Источник файлов", ("Из папки", "Загрузить файлы"))
-        selected_files = None
-        uploaded = None
-        if input_mode == "Из папки":
-            p = Path(input_dir)
-            if not p.exists():
+    if "logs" not in st.session_state:
+        st.session_state.logs = []
+
+    # ensure defaults in session_state
+    defaults = {
+        "input_dir": "./input",
+        "output_dir": "./output",
+        "input_mode": "Из папки",
+        "remove_bg": True,
+        "remove_wm": False,
+        "wm_threshold": 220,
+        "wm_radius": 5,
+        "fmt": "PNG",
+        "jpeg_q": 95,
+        "resize_mode": "Оригинал",
+        "target_width": None,
+        "target_height": None,
+        "selected_files": [],
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+    # Layout: left navigation, right settings
+    left_col, right_col = st.columns([1, 3])
+    with left_col:
+        st.markdown("## Секции")
+        section = st.radio(
+            "Выберите секцию",
+            options=[
+                "Источник / Сохранение",
+                "Обработка",
+                "Изменение размера",
+                "Формат / Качество",
+                "Дополнительно",
+                "Журнал"
+            ],
+            index=0
+        )
+
+    with right_col:
+        st.markdown(f"### {section}")
+        if section == "Источник / Сохранение":
+            st.session_state.input_dir = st.text_input("Входная папка (путь)", value=st.session_state.input_dir)
+            st.session_state.input_mode = st.radio("Источник файлов", ("Из папки", "Загрузить файлы"), index=0 if st.session_state.input_mode == "Из папки" else 1)
+            st.session_state.output_dir = st.text_input("Выходная папка (куда сохранять)", value=st.session_state.output_dir)
+            if st.button("Создать выходную папку (если не существует)"):
                 try:
-                    p.mkdir(parents=True, exist_ok=True)
-                    st.warning(f"Папка '{p}' создана.")
-                except Exception:
-                    st.error(f"Не удалось создать папку '{p}'.")
-            files = get_image_files(Path(input_dir)) if Path(input_dir).exists() else []
-            names = [f.name for f in files]
-            selected_files = st.multiselect("Выберите файлы (если пусто — все)", options=names)
-        else:
-            uploaded = st.file_uploader("Загрузите файлы", type=[e.lstrip(".") for e in SUPPORTED_EXTENSIONS], accept_multiple_files=True)
+                    Path(st.session_state.output_dir).expanduser().mkdir(parents=True, exist_ok=True)
+                    st.success(f"Папка '{st.session_state.output_dir}' создана/существует")
+                except Exception as e:
+                    st.error(f"Не удалось создать папку: {e}")
 
+            if st.session_state.input_mode == "Из папки":
+                p = Path(st.session_state.input_dir)
+                if p.exists():
+                    files = get_image_files(p)
+                    names = [f.name for f in files]
+                    st.session_state.selected_files = st.multiselect("Выберите файлы (оставьте пустым = все)", options=names, default=st.session_state.get("selected_files", []))
+                else:
+                    st.info("Указанная входная папка не найдена. Она будет создана при запуске.")
+        elif section == "Обработка":
+            st.session_state.remove_bg = st.checkbox("Удалить фон (rembg если доступен)", value=st.session_state.remove_bg)
+            if st.session_state.remove_bg and not HAS_REMBG:
+                st.caption("rembg не установлен — будет использоваться GrabCut (фоллбек).")
+            st.session_state.remove_wm = st.checkbox("Удалить водяные знаки (inpaint)", value=st.session_state.remove_wm)
+            if st.session_state.remove_wm:
+                st.session_state.wm_radius = st.slider("Радиус inpaint", 1, 25, value=st.session_state.wm_radius)
+                st.session_state.wm_threshold = st.slider("Порог яркости для маски", 0, 255, value=st.session_state.wm_threshold)
+        elif section == "Изменение размера":
+            st.session_state.resize_mode = st.selectbox("Режим изменения размера", ("Оригинал", "Ширина", "Высота", "Оба"), index=0 if st.session_state.resize_mode == "Оригинал" else (1 if st.session_state.resize_mode=="Ширина" else (2 if st.session_state.resize_mode=="Высота" else 3)))
+            if st.session_state.resize_mode == "Ширина":
+                st.session_state.target_width = st.number_input("Ширина (px)", min_value=1, value=st.session_state.target_width or 1920)
+                st.session_state.target_height = None
+            elif st.session_state.resize_mode == "Высота":
+                st.session_state.target_height = st.number_input("Высота (px)", min_value=1, value=st.session_state.target_height or 1080)
+                st.session_state.target_width = None
+            elif st.session_state.resize_mode == "Оба":
+                st.session_state.target_width = st.number_input("Ширина (px)", min_value=1, value=st.session_state.target_width or 1920)
+                st.session_state.target_height = st.number_input("Высота (px)", min_value=1, value=st.session_state.target_height or 1080)
+            else:
+                st.session_state.target_width = None
+                st.session_state.target_height = None
+        elif section == "Формат / Качество":
+            st.session_state.fmt = st.radio("Формат вывода", ("PNG", "JPEG"), index=0 if st.session_state.fmt=="PNG" else 1)
+            if st.session_state.fmt == "JPEG":
+                st.session_state.jpeg_q = st.slider("Качество JPEG", 50, 100, value=st.session_state.jpeg_q)
+            else:
+                st.session_state.jpeg_q = 95
+        elif section == "Дополнительно":
+            st.markdown("Дополнительные параметры и конфигурация")
+            cfg_file = st.file_uploader("Загрузить config.json (опционально)", type=["json"])
+            if cfg_file:
+                try:
+                    cfg = json.load(cfg_file)
+                    for k in ("input_dir","output_dir","remove_bg","remove_wm","wm_threshold","wm_radius","fmt","jpeg_q","target_width","target_height"):
+                        if k in cfg:
+                            st.session_state[k] = cfg[k]
+                    st.success("Конфигурация загружена в текущую сессию")
+                except Exception as e:
+                    st.error(f"Ошибка чтения config: {e}")
+            if st.button("Сохранить текущую конфигурацию в config.json"):
+                try:
+                    cfg = {
+                        "input_dir": st.session_state.input_dir,
+                        "output_dir": st.session_state.output_dir,
+                        "remove_bg": st.session_state.remove_bg,
+                        "remove_wm": st.session_state.remove_wm,
+                        "wm_threshold": st.session_state.wm_threshold,
+                        "wm_radius": st.session_state.wm_radius,
+                        "fmt": st.session_state.fmt,
+                        "jpeg_q": st.session_state.jpeg_q,
+                        "target_width": st.session_state.target_width,
+                        "target_height": st.session_state.target_height,
+                    }
+                    with open("config.json", "w", encoding="utf-8") as f:
+                        json.dump(cfg, f, ensure_ascii=False, indent=2)
+                    st.success("config.json сохранён локально")
+                except Exception as e:
+                    st.error(f"Не удалось сохранить config.json: {e}")
+        elif section == "Журнал":
+            st.subheader("Лог последних запусков")
+            if st.session_state.logs:
+                with st.expander("Показать лог", expanded=False):
+                    st.code("\n".join(st.session_state.logs))
+            else:
+                st.info("Лог пуст. Запустите обработку.")
+
+        st.markdown("---")
         run = st.button("🚀 Запустить обработку")
 
+    # Handle uploaded files if chosen
+    uploaded_files = None
+    if st.session_state.get("input_mode") == "Загрузить файлы":
+        # We'll ask user to upload files right before running to ensure they are available
+        pass
+
     if run:
+        input_dir = st.session_state.input_dir
+        output_dir = st.session_state.output_dir
+        Path(input_dir).expanduser().mkdir(parents=True, exist_ok=True)
+        Path(output_dir).expanduser().mkdir(parents=True, exist_ok=True)
+
+        selected = st.session_state.get("selected_files", None)
         uploaded_files = None
-        if input_mode != "Из папки" and uploaded:
-            uploaded_files = uploaded
-        selected = selected_files if selected_files else None
+        if st.session_state.get("input_mode") == "Загрузить файлы":
+            uploaded = st.file_uploader("Загрузите файлы для обработки (повторно, если не прикрепили ранее)", accept_multiple_files=True)
+            if uploaded:
+                uploaded_files = []
+                for uf in uploaded:
+                    try:
+                        uploaded_files.append((uf.name, uf.read()))
+                    except Exception:
+                        st.warning(f"Не удалось прочитать загруженный файл {uf.name}")
 
-        valid, msg = validate_path(Path(input_dir), is_input=True)
-        if not valid:
-            st.error(msg); return
-        valid, msg = validate_path(Path(output_dir), is_input=False)
-        if not valid:
-            st.error(msg); return
-        Path(output_dir).mkdir(parents=True, exist_ok=True)
-
-        with st.spinner("Обработка..."):
+        st.session_state.logs = []
+        with st.spinner("Обработка изображений..."):
             logs = process_batch(
                 input_dir=input_dir,
                 output_dir=output_dir,
-                remove_bg=remove_bg,
-                remove_wm=remove_wm,
-                wm_threshold=wm_threshold,
-                wm_radius=wm_radius,
-                fmt=fmt,
-                jpeg_q=jpeg_q,
-                target_width=target_width,
-                target_height=target_height,
+                remove_bg=st.session_state.remove_bg,
+                remove_wm=st.session_state.remove_wm,
+                wm_threshold=st.session_state.wm_threshold,
+                wm_radius=st.session_state.wm_radius,
+                fmt=st.session_state.fmt,
+                jpeg_q=st.session_state.jpeg_q,
+                target_width=st.session_state.target_width,
+                target_height=st.session_state.target_height,
                 selected_filenames=selected,
                 uploaded_files=uploaded_files,
                 show_preview=True,
             )
-        st.success("Готово")
         for l in logs:
-            if l.startswith("✅"):
-                st.markdown(f"<span style='color:green'>{l}</span>", unsafe_allow_html=True)
-            elif l.startswith("❌"):
-                st.markdown(f"<span style='color:red'>{l}</span>", unsafe_allow_html=True)
-            else:
-                st.text(l)
+            st.session_state.logs.append(l)
 
-        # preview first few processed images
-        processed = [f for f in Path(output_dir).iterdir() if f.is_file() and validate_file_extension(f)]
+        st.success(f"Обработка завершена. Результаты сохранены в: {output_dir}")
+        with st.expander("Показать лог обработки", expanded=True):
+            st.code("\n".join(st.session_state.logs))
+
+        # Create zip of output_dir for download
+        try:
+            outp = Path(output_dir)
+            zip_base = outp / "results_archive"
+            zip_archive = shutil.make_archive(str(zip_base), 'zip', root_dir=str(outp))
+            with open(zip_archive, "rb") as f:
+                st.download_button(
+                    label="Скачать ZIP с результатами",
+                    data=f,
+                    file_name=Path(zip_archive).name,
+                    mime="application/zip"
+                )
+            st.info(f"ZIP создан: {zip_archive}")
+        except Exception as e:
+            st.error(f"Не удалось создать ZIP: {e}")
+
+        # Display small preview of results
+        processed = [f for f in Path(output_dir).iterdir() if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS]
         if processed:
-            st.subheader("Превью")
+            st.subheader("Превью результатов (первые 8)")
             cols = st.columns(2)
             for i, f in enumerate(sorted(processed)[:8]):
                 with cols[i % 2]:
                     st.image(str(f), caption=f.name, use_column_width=True)
-
-    # Save config
-    if st.sidebar.button("Сохранить конфигурацию"):
-        cfg = {
-            "input_dir": input_dir,
-            "output_dir": output_dir,
-            "remove_bg": remove_bg,
-            "remove_wm": remove_wm,
-            "wm_threshold": wm_threshold,
-            "wm_radius": wm_radius,
-            "fmt": fmt,
-            "jpeg_q": jpeg_q,
-            "target_width": target_width,
-            "target_height": target_height,
-        }
-        try:
-            save_config(cfg, "config.json")
-            st.sidebar.success("config.json сохранён")
-        except Exception as e:
-            st.sidebar.error(f"Ошибка: {e}")
 
 def main():
     if len(sys.argv) > 1 and sys.argv[1] != "streamlit":
