@@ -1,11 +1,10 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — исправленная версия с поддержкой нескольких наборов параметров.
-- CLI: можно передать один набор параметров через флаги или несколько через JSON-файл (--presets).
-- Streamlit: поддержка тех же настроек (если установлен).
-- Результаты каждого набора параметров сохраняются в отдельной подпапке внутри выходной папки.
-- ZIP архива создаётся вне выходной папки (в temp) для скачивания.
+Photo Processor Pro — исправленная и полная версия.
+Поддержка: CLI и Streamlit UI (опционально).
+Умеет применять несколько пресетов (параметров) и сохранять результаты в подпапки.
+Создаёт ZIP с результатами вне выходной директории.
 """
 from __future__ import annotations
 
@@ -191,7 +190,6 @@ def save_image(img_cv: np.ndarray, out_path: Path, preset: Preset) -> bool:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         img_cv = resize_image(img_cv, preset.target_width, preset.target_height)
         if preset.fmt.upper().startswith("PNG"):
-            # keep alpha channel if present
             cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 3])
             return True
         bgr = img_cv
@@ -318,8 +316,6 @@ def load_presets_from_json(path: Path) -> List[Preset]:
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
     if isinstance(data, dict):
-        # single preset object or a dict of presets
-        # allow {"presets":[...]} or single
         if "presets" in data and isinstance(data["presets"], list):
             arr = data["presets"]
         else:
@@ -341,7 +337,6 @@ def cli_main(argv=None):
     parser.add_argument("--input", "-i", default="./input", help="Input folder with images")
     parser.add_argument("--output", "-o", default="./output", help="Output folder")
     parser.add_argument("--presets", help="JSON file with list of presets (overrides CLI flags)")
-    # single preset flags (used if --presets not provided)
     parser.add_argument("--label", default="default", help="Label for this preset")
     parser.add_argument("--no-bg", dest="remove_bg", action="store_false", help="Disable background removal")
     parser.add_argument("--remove-wm", dest="remove_wm", action="store_true", help="Enable watermark removal")
@@ -373,7 +368,6 @@ def cli_main(argv=None):
     logs = process_batch(args.input, args.output, presets, selected=selected, uploaded_files=None)
     for l in logs:
         print(l)
-    # create zip
     try:
         zip_path = create_zip_of_output(args.output)
         print(f"ZIP created: {zip_path}")
@@ -407,8 +401,6 @@ def run_streamlit_app():
                                        }], ensure_ascii=False, indent=2))
 
     try:
-        presets = load_presets_from_json(Path(tempfile.gettempdir()) / "tmp_presets.json") if False else []
-        # parse text area
         parsed = json.loads(presets_data)
         if isinstance(parsed, dict) and "presets" in parsed:
             arr = parsed["presets"]
