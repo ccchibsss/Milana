@@ -1,6 +1,6 @@
 streamlit>=1.38.0
-rembg>=2.1.0
-opencv-python>=4.9.0
-numpy>=1.24.0
-Pillow>=10.0.0
-pathlib>=1.0.1
+rembg==2.0.69  # или удалите эту строку
+rich>=10.14.0
+opencv-python-headless
+Pillow
+numpy
