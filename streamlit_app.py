@@ -1,11 +1,8 @@
 # !/usr/bin/env python3
 """
-Photo Processor Pro — полный скрипт со «меню» и боковой панелью (Streamlit).
-Добавлена гибкая настройка куда сохранять обработанные файлы:
-- В отдельную выходную папку (по умолчанию)
-- Рядом с оригиналом (с суффиксом)
-- В выходную папку с зеркальной структурой входных папок
-Поддерживает CLI-режим, если streamlit не установлен.
+Photo Processor Pro — улучшенная версия с безопасным интерактивным выбором
+куда сохранять (без ошибок, если tkinter недоступен / среда headless).
+Поддерживает --ask-save (CLI) и Streamlit UI (если установлен).
 """
 
 from pathlib import Path
@@ -48,9 +45,9 @@ def setup_logger():
 
 logger = setup_logger()
 
-# helpers
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
+# --- filesystem helpers -----------------------------------------------------
 def validate_paths(input_path: Path, output_path: Path) -> Tuple[bool, str]:
     if not input_path.exists():
         return False, f"Папка {input_path} не существует"
@@ -86,28 +83,30 @@ def get_image_files_from_dirs(dirs: List[Path], recursive: bool=False) -> List[P
     return sorted(set(found), key=lambda p: p.as_posix())
 
 def find_input_root_for_path(p: Path, input_dirs: List[Path]) -> Optional[Path]:
-    """Вернуть тот входной корень, которому принадлежит p (или ближайший ancestor)."""
     p_resolved = p.resolve()
-    for root in sorted(input_dirs, key=lambda r: len(str(r)), reverse=True):
+    # sort by length descending for longest match first
+    roots = sorted((r.resolve() for r in input_dirs), key=lambda r: len(str(r)), reverse=True)
+    for root in roots:
         try:
-            if p_resolved.is_relative_to(root.resolve()):  # Python 3.9+
+            # Python 3.9+: is_relative_to
+            if hasattr(p_resolved, "is_relative_to"):
+                if p_resolved.is_relative_to(root):
+                    return root
+            else:
+                p_resolved.relative_to(root)
                 return root
         except Exception:
-            try:
-                p_resolved.relative_to(root.resolve())
-                return root
-            except Exception:
-                continue
+            continue
     return None
 
 def compute_output_path(original: Path, out_root: Path, save_mode: str,
                         input_roots: List[Path], suffix: str = "_proc") -> Path:
     """
-    save_mode:
-      - "out" — все в out_root
-      - "inplace" — рядом с оригиналом, имя + suffix
-      - "mirror" — в out_root с зеркальной структурой относительно одного из input_roots
-    Возвращает Path без расширения (функция save_image добавит расширение).
+    Возвращает базовый путь (без расширения) куда сохранять:
+      - out     : out_root / original.stem
+      - inplace : рядом с оригиналом, имя+suffix
+      - mirror  : out_root / relative_parent / original.stem (если original внутри одного из input_roots)
+                 иначе fallback в out_root / original.stem
     """
     if save_mode == "inplace":
         return original.parent / f"{original.stem}{suffix}"
@@ -120,11 +119,11 @@ def compute_output_path(original: Path, out_root: Path, save_mode: str,
                 return target_dir / original.stem
             except Exception:
                 pass
-        # fallback to flat out_root
         return out_root / original.stem
-    # default "out"
+    # default out
     return out_root / original.stem
 
+# --- image processing helpers ----------------------------------------------
 def remove_background_pil(img_pil: Image.Image) -> Image.Image:
     if REMBG_AVAILABLE and rembg_remove is not None:
         try:
@@ -176,8 +175,14 @@ def remove_watermark_cv(img_cv: np.ndarray, threshold: int, radius: int) -> np.n
         return inpainted
     return img_cv
 
+def pil_to_cv(img_pil: Image.Image) -> np.ndarray:
+    if img_pil.mode == "RGBA":
+        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGBA2BGRA)
+    else:
+        rgb = img_pil.convert("RGB")
+        return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+
 def save_image(img_cv: np.ndarray, out_path_base: Path, fmt: str, jpeg_q: int=95) -> Path:
-    """Сохраняет изображение, возвращает фактический путь файла."""
     out_path_base.parent.mkdir(parents=True, exist_ok=True)
     if fmt == "PNG (с альфа)" and img_cv.ndim == 3 and img_cv.shape[2] == 4:
         out_path = out_path_base.with_suffix(".png")
@@ -192,14 +197,83 @@ def save_image(img_cv: np.ndarray, out_path_base: Path, fmt: str, jpeg_q: int=95
     out_path.write_bytes(buf.tobytes())
     return out_path
 
-def pil_to_cv(img_pil: Image.Image) -> np.ndarray:
-    if img_pil.mode == "RGBA":
-        return cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGBA2BGRA)
-    else:
-        rgb = img_pil.convert("RGB")
-        return cv2.cvtColor(np.array(rgb), cv2.COLOR_RGB2BGR)
+# --- interactive choice (safe) ---------------------------------------------
+def _tk_available_for_dialog() -> bool:
+    """
+    Return True only if tkinter import succeeds and environment likely supports GUI:
+     - on Unix require DISPLAY env var
+     - on Windows/Mac assume available if import succeeds
+    """
+    try:
+        import tkinter  # noqa: F401
+    except Exception:
+        return False
+    if os.name == "posix":
+        return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+    return True
 
-# Streamlit UI
+def choose_save_settings(input_roots: List[Path],
+                         default_mode: str = "out",
+                         default_out: str = "./output",
+                         default_suffix: str = "_proc") -> Tuple[str, Path, str]:
+    """
+    Interactively ask user where to save processed files.
+    Falls back to textual input if GUI dialog unavailable.
+    Returns (save_mode, out_root_path, suffix).
+    """
+    def ask_text(prompt: str, default: Optional[str] = None) -> str:
+        if default is not None:
+            res = input(f"{prompt} [Enter = {default}]: ").strip()
+            return res or default
+        return input(f"{prompt}: ").strip()
+
+    print("Куда сохранять обработанные файлы?")
+    print("  1) out     - все в указанную выходную папку")
+    print("  2) inplace - рядом с оригиналом (добавить суффикс)")
+    print("  3) mirror  - в выходную папку с зеркальной структурой входных папок")
+    default_num = {"out": "1", "inplace": "2", "mirror": "3"}.get(default_mode, "1")
+    choice = ask_text("Выберите режим (1/2/3)", default=default_num)
+    save_mode = {"1": "out", "2": "inplace", "3": "mirror"}.get(choice, default_mode)
+
+    out_root = Path(default_out)
+    suffix = default_suffix
+
+    if save_mode in ("out", "mirror"):
+        if _tk_available_for_dialog():
+            try:
+                # safe import/use of tkinter only when plausible
+                import tkinter as tk  # type: ignore
+                from tkinter import filedialog  # type: ignore
+                root = tk.Tk(); root.withdraw()
+                selected = filedialog.askdirectory(initialdir=str(out_root) if out_root.exists() else None,
+                                                   title="Выберите выходную папку")
+                root.destroy()
+                if selected:
+                    out_root = Path(selected)
+                else:
+                    out_root = Path(ask_text("Укажите путь к выходной папке", default=str(out_root)))
+            except Exception:
+                out_root = Path(ask_text("Укажите путь к выходной папке", default=str(out_root)))
+        else:
+            out_root = Path(ask_text("Укажите путь к выходной папке", default=str(out_root)))
+        try:
+            out_root.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise RuntimeError(f"Не удалось создать/доступ к выходной папке {out_root}: {e}")
+
+    if save_mode == "inplace":
+        suffix = ask_text("Укажите суффикс для inplace (будет добавлен к stem):", default=suffix)
+
+    logger.info("Save settings: mode=%s out=%s suffix=%s", save_mode, out_root, suffix)
+    print(f"Выбран режим: {save_mode}")
+    if save_mode in ("out", "mirror"):
+        print(f"Выходная папка: {out_root}")
+    if save_mode == "inplace":
+        print(f"Суффикс для inplace: {suffix}")
+
+    return save_mode, out_root, suffix
+
+# --- Streamlit UI (unchanged, safe) ---------------------------------------
 def main_streamlit():
     st.set_page_config(page_title="Photo Processor Pro", layout="wide")
     st.title("🖼️ Photo Processor Pro")
@@ -240,7 +314,7 @@ def main_streamlit():
             ("out", "В отдельную выходную папку (по умолчанию)"),
             ("inplace", "Рядом с оригиналом (добавить суффикс)"),
             ("mirror", "В выходную папку с зеркальной структурой")
-        ], format_func=lambda x: x[1])[0]  # store keys
+        ], format_func=lambda x: x[1])[0]
         output_dir = st.text_input("Выходная папка (используется для режимов out/mirror)", value="./output")
         fname_suffix = st.text_input("Суффикс для inplace (например _proc)", value="_proc")
 
@@ -297,14 +371,12 @@ def main_streamlit():
                         out_base = compute_output_path(p, out_path, save_mode, dirs, suffix=fname_suffix)
                         out_file = save_image(img_cv, out_base, fmt, jpeg_q)
                         msg = f"✅ {idx+1}/{total}: {p.name} → {out_file}"
-                        logs.append(msg)
-                        log_box.code("\n".join(logs[-10:]))
-                        idx += 1
+                        logs.append(msg); log_box.code("\n".join(logs[-10:])); idx += 1
                 except UnidentifiedImageError:
                     err = f"❌ {idx+1}/{total}: Не удалось открыть {p.name}"
                     logs.append(err); log_box.code("\n".join(logs[-10:])); logger.error(err); idx += 1
-                except Exception as e:
-                    err = f"❌ {idx+1}/{total}: Ошибка {p.name} — {e}"
+                except Exception:
+                    err = f"❌ {idx+1}/{total}: Ошибка {p.name}"
                     logs.append(err); log_box.code("\n".join(logs[-10:])); logger.error(traceback.format_exc()); idx += 1
                 progress.progress(idx / total)
 
@@ -316,17 +388,15 @@ def main_streamlit():
                     img_cv = pil_to_cv(pil)
                     if remove_wm:
                         img_cv = remove_watermark_cv(img_cv, wm_threshold, wm_radius)
-                    # For uploaded files we can't mirror original structure; use out_path or inplace isn't applicable
                     if save_mode == "inplace":
-                        # save next to current working directory
                         out_base = Path.cwd() / f"{Path(mf['name']).stem}{fname_suffix}"
                     else:
                         out_base = compute_output_path(Path(mf["name"]), out_path, save_mode, dirs, suffix=fname_suffix)
                     out_file = save_image(img_cv, out_base, fmt, jpeg_q)
                     msg = f"✅ {idx+1}/{total}: {mf['name']} → {out_file}"
                     logs.append(msg); log_box.code("\n".join(logs[-10:])); idx += 1
-                except Exception as e:
-                    err = f"❌ {idx+1}/{total}: Ошибка {mf['name']} — {e}"
+                except Exception:
+                    err = f"❌ {idx+1}/{total}: Ошибка {mf['name']}"
                     logs.append(err); log_box.code("\n".join(logs[-10:])); logger.error(traceback.format_exc()); idx += 1
                 progress.progress(idx / total)
 
@@ -349,7 +419,7 @@ def main_streamlit():
             """
         )
 
-# CLI fallback
+# --- CLI processing --------------------------------------------------------
 def process_cli(input_dirs: List[str], output_dir: str, recursive: bool,
                 remove_bg: bool, remove_wm: bool, wm_threshold: int, wm_radius: int,
                 fmt: str, jpeg_q: int, save_mode: str, suffix: str):
@@ -377,31 +447,52 @@ def process_cli(input_dirs: List[str], output_dir: str, recursive: bool,
                 out_file = save_image(img_cv, out_base, fmt, jpeg_q)
                 msg = f"✅ {idx+1}/{len(images)}: {p.name} → {out_file}"
                 logs.append(msg); print(msg)
-        except Exception as e:
-            err = f"❌ {idx+1}/{len(images)}: {p.name} — {e}"
+        except Exception:
+            err = f"❌ {idx+1}/{len(images)}: {p.name} — ошибка"
             logs.append(err); print(err); logger.error(traceback.format_exc())
     print("Готово. Лог:")
     print("\n".join(logs))
 
-# entrypoint
-if __name__ == "__main__":
+# --- entrypoint ------------------------------------------------------------
+def _main():
     if STREAMLIT_AVAILABLE:
         main_streamlit()
-    else:
-        parser = argparse.ArgumentParser(description="Photo Processor Pro — CLI")
-        parser.add_argument("-i", "--input", nargs="+", default=[str(Path.cwd())], help="папки для обработки")
-        parser.add_argument("-o", "--output", default="./output", help="выходная папка")
-        parser.add_argument("-r", "--recursive", action="store_true", help="рекурсивно")
-        parser.add_argument("--no-bg", dest="remove_bg", action="store_false", help="не удалять фон")
-        parser.add_argument("--wm", dest="remove_wm", action="store_true", help="удалять водяные знаки")
-        parser.add_argument("--wm-th", type=int, default=220, help="порог для водяных знаков")
-        parser.add_argument("--wm-r", type=int, default=5, help="радиус инпейнта")
-        parser.add_argument("--fmt", choices=["PNG", "JPEG"], default="PNG", help="формат вывода")
-        parser.add_argument("--q", type=int, default=95, help="качество JPEG")
-        parser.add_argument("--save-mode", choices=["out", "inplace", "mirror"], default="out",
-                            help="куда сохранять: out (в выходную папку), inplace (рядом, с суффиксом), mirror (зеркальная структура)")
-        parser.add_argument("--suffix", default="_proc", help="суффикс для inplace")
-        args = parser.parse_args()
-        fmt = "PNG (с альфа)" if args.fmt == "PNG" else "JPEG (без альфа)"
-        process_cli(args.input, args.output, args.recursive, args.remove_bg, args.remove_wm,
-                    args.wm_th, args.wm_r, fmt, args.q, args.save_mode, args.suffix)
+        return
+
+    parser = argparse.ArgumentParser(description="Photo Processor Pro — CLI")
+    parser.add_argument("-i", "--input", nargs="+", default=[str(Path.cwd())], help="папки для обработки")
+    parser.add_argument("-o", "--output", default="./output", help="выходная папка")
+    parser.add_argument("-r", "--recursive", action="store_true", help="рекурсивно")
+    parser.add_argument("--no-bg", dest="remove_bg", action="store_false", help="не удалять фон")
+    parser.add_argument("--wm", dest="remove_wm", action="store_true", help="удалять водяные знаки")
+    parser.add_argument("--wm-th", type=int, default=220, help="порог для водяных знаков")
+    parser.add_argument("--wm-r", type=int, default=5, help="радиус инпейнта")
+    parser.add_argument("--fmt", choices=["PNG", "JPEG"], default="PNG", help="формат вывода")
+    parser.add_argument("--q", type=int, default=95, help="качество JPEG")
+    parser.add_argument("--save-mode", choices=["out", "inplace", "mirror"], default="out",
+                        help="куда сохранять: out, inplace, mirror")
+    parser.add_argument("--suffix", default="_proc", help="суффикс для inplace")
+    parser.add_argument("--ask-save", action="store_true",
+                        help="Запросить интерактивно где сохранять перед запуском (CLI ввод)")
+    args = parser.parse_args()
+
+    fmt = "PNG (с альфа)" if args.fmt == "PNG" else "JPEG (без альфа)"
+
+    if args.ask_save:
+        try:
+            save_mode, out_root, suffix = choose_save_settings([Path(p) for p in args.input],
+                                                               default_mode=args.save_mode or "out",
+                                                               default_out=args.output,
+                                                               default_suffix=args.suffix)
+            args.save_mode = save_mode
+            args.output = str(out_root)
+            args.suffix = suffix
+        except Exception as e:
+            print("Ошибка при интерактивном выборе пути сохранения:", e)
+            return
+
+    process_cli(args.input, args.output, args.recursive, args.remove_bg, args.remove_wm,
+                args.wm_th, args.wm_r, fmt, args.q, args.save_mode, args.suffix)
+
+if __name__ == "__main__":
+    _main()
