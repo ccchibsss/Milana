@@ -1,5 +1,5 @@
 streamlit==1.27.2
-Pillow==9.5.0
-opencv-python==4.5.5.62
-rembg
-numpy
+Pillow==9.4.0
+rembg==3.0.0
+opencv-python-headless==4.8.0.74
+numpy==1.23.5
