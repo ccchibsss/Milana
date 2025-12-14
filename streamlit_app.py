@@ -15,7 +15,7 @@ import os
 import traceback
 import argparse
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -51,7 +51,7 @@ logger = setup_logger()
 # helpers
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-def validate_paths(input_path: Path, output_path: Path) -> (bool, str):
+def validate_paths(input_path: Path, output_path: Path) -> Tuple[bool, str]:
     if not input_path.exists():
         return False, f"Папка {input_path} не существует"
     if not os.access(input_path, os.R_OK):
@@ -93,7 +93,6 @@ def find_input_root_for_path(p: Path, input_dirs: List[Path]) -> Optional[Path]:
             if p_resolved.is_relative_to(root.resolve()):  # Python 3.9+
                 return root
         except Exception:
-            # fallback for older versions
             try:
                 p_resolved.relative_to(root.resolve())
                 return root
