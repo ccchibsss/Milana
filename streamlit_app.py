@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — улучшенная версия
-- Структурированное решение
+Photo Processor Pro — расширенная версия
 - CLI + Streamlit интерфейсы
 - Многопроцессная обработка
 - Конфигурация через dataclass
-- Надежное логирование
+- Логирование
 """
 
 import argparse
@@ -20,7 +19,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime
-from typing import List, Optional, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Any
 
 import cv2
 import numpy as np
@@ -52,13 +51,25 @@ class Config:
     target_height: Optional[int] = None
     input_dir: Path = Path("./input")
     output_dir: Path = Path("./output")
+    save_in_custom_folder: bool = False
+    custom_save_folder: Optional[Path] = None
 
     def validate(self):
+        # Создаем папки, если их нет
         if not self.input_dir.exists():
-            raise ValueError(f"Папка входных изображений не существует: {self.input_dir}")
-        if not self.input_dir.is_dir():
+            print(f"Папка входных изображений не найдена, создаем: {self.input_dir}")
+            self.input_dir.mkdir(parents=True, exist_ok=True)
+        elif not self.input_dir.is_dir():
             raise ValueError(f"Путь входных изображений не папка: {self.input_dir}")
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+
+        # Создаем папку для сохранения, если нужно
+        if self.save_in_custom_folder and self.custom_save_folder:
+            if not self.custom_save_folder.exists():
+                print(f"Создаем папку для сохранения: {self.custom_save_folder}")
+                self.custom_save_folder.mkdir(parents=True, exist_ok=True)
+        else:
+            # Можно оставить как есть, если не указана
+            pass
 
 # --- Логирование ---
 logger = logging.getLogger(__name__)
@@ -85,7 +96,7 @@ def rembg_background(pil_img: Image.Image) -> Image.Image:
             return Image.open(io.BytesIO(out_bytes))
         if isinstance(out_bytes, Image.Image):
             return out_bytes
-    except Exception:
+    except:
         logger.exception("Ошибка rembg")
     return pil_img
 
@@ -107,7 +118,7 @@ def grabcut_background(pil_img: Image.Image) -> Image.Image:
         img_rgba = cv2.cvtColor(img, cv2.COLOR_RGB2RGBA)
         img_rgba[..., 3] = alpha
         return Image.fromarray(img_rgba)
-    except Exception:
+    except:
         logger.exception("Ошибка grabcut")
         return pil_img
 
@@ -141,7 +152,7 @@ def remove_watermark(img_cv: np.ndarray, config: Config) -> np.ndarray:
                 return out
             return inpainted
         return img_cv
-    except Exception:
+    except:
         logger.exception("Ошибка удаления водяных знаков")
         return img_cv
 
@@ -188,11 +199,16 @@ def save_image(img_cv: np.ndarray, out_path: Path, config: Config) -> bool:
                 out_path.write_bytes(buf.tobytes())
                 return True
         return False
-    except Exception:
+    except:
         logger.exception("Ошибка сохранения")
         return False
 
-# --- Обработка задач ---
+# --- Валидация файла ---
+SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
+def validate_file_extension(path: Path) -> bool:
+    return path.suffix.lower() in SUPPORTED_EXTENSIONS
+
+# --- Обработка одной задачи ---
 def process_single_task(task: Tuple[str, str, Any], config: Config) -> str:
     src_type, name, payload = task
     try:
@@ -226,7 +242,7 @@ def process_single_task(task: Tuple[str, str, Any], config: Config) -> str:
             return f"❌ Ошибка сохранения {name}"
     except UnidentifiedImageError:
         return f"❌ Не удалось открыть {name} (не изображение/повреждён)"
-    except Exception:
+    except:
         logger.exception(f"Ошибка обработки {name}")
         return f"❌ Ошибка обработки {name}"
 
@@ -238,20 +254,19 @@ def process_batch(
     filenames: Optional[List[str]] = None,
     uploaded_files: Optional[List[Any]] = None
 ) -> List[str]:
-
     # Валидация путей
     config.validate()
 
     tasks: List[Tuple[str, str, Any]] = []
 
-    # Загруженные файлы
+    # Обработка загруженных файлов (если есть)
     if uploaded_files:
         for f in uploaded_files:
             name = getattr(f, "name", None)
             if name and validate_file_extension(Path(name)):
                 tasks.append(("uploaded", name, f))
     else:
-        # Файлы на диске
+        # Обработка файлов на диске
         for p in config.input_dir.iterdir():
             if p.is_file() and validate_file_extension(p):
                 if not filenames or p.name in filenames:
@@ -270,18 +285,12 @@ def process_batch(
                 res = future.result()
                 logs.append(res)
                 logger.info(res)
-            except Exception:
+            except:
                 logger.exception("Ошибка в воркере")
                 logs.append("❌ В процессе возникла ошибка")
     return logs
 
-# --- Проверка расширения файла ---
-SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-
-def validate_file_extension(path: Path) -> bool:
-    return path.suffix.lower() in SUPPORTED_EXTENSIONS
-
-# --- CLI ---
+# --- CLI интерфейс ---
 def run_cli():
     parser = argparse.ArgumentParser(description="Photo Processor Pro CLI")
     parser.add_argument("--input", "-i", default="./input", help="Папка с изображениями")
@@ -298,12 +307,12 @@ def run_cli():
 
     args = parser.parse_args()
 
-    # Загрузка конфигурации
+    # Загрузка конфигурации из файла (если есть)
     cfg_data = {}
     try:
         with open(args.config, "r", encoding="utf-8") as f:
             cfg_data = json.load(f)
-    except Exception:
+    except:
         logger.warning("Нет файла конфигурации или ошибка чтения, используют параметры по умолчанию.")
 
     config = Config(
@@ -316,7 +325,9 @@ def run_cli():
         fmt=args.fmt,
         jpeg_q=args.jpeg_q,
         target_width=args.width,
-        target_height=args.height
+        target_height=args.height,
+        save_in_custom_folder=False,  # по умолчанию
+        custom_save_folder=None
     )
 
     try:
@@ -348,6 +359,8 @@ def run_streamlit():
         jpeg_q = st.slider("Качество JPEG", 1, 100, 95) if fmt == "JPEG" else 95
         width = st.number_input("Ширина (px)", min_value=1, max_value=10000, value=None, step=1)
         height = st.number_input("Высота (px)", min_value=1, max_value=10000, value=None, step=1)
+        save_in_custom_folder = st.checkbox("Сохранять в отдельную папку", value=False)
+        custom_folder_path = st.text_input("Путь к папке для результатов", value="./results")
 
     # Загрузка файлов
     uploaded_files = st.file_uploader(
@@ -382,10 +395,12 @@ def run_streamlit():
                     wm_radius=wm_radius,
                     fmt=fmt,
                     jpeg_q=jpeg_q,
-                    target_width=width,
-                    target_height=height,
+                    target_width=width if width else None,
+                    target_height=height if height else None,
                     input_dir=temp_dir,
-                    output_dir=Path("./streamlit_output")
+                    output_dir=Path("./streamlit_output"),
+                    save_in_custom_folder=save_in_custom_folder,
+                    custom_save_folder=Path(custom_folder_path)
                 )
 
                 # Обработка
@@ -417,7 +432,7 @@ def create_zip_of_output(output_dir: str, zip_name: Optional[str] = None) -> Pat
     zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=str(outp))
     return Path(zip_path)
 
-# --- Основной вход ---
+# --- Основной запуск ---
 def main():
     parser = argparse.ArgumentParser(description="Photo Processor Pro")
     parser.add_argument("--mode", choices=["cli", "streamlit"], default="cli")
