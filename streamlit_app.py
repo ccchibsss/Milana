@@ -1,10 +1,9 @@
-# !/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Streamlit app: Photo Processor Pro — robust fixed version.
-- No matplotlib dependency (uses OpenCV/PIL for histogram visualization).
-- Uses rembg if available; falls back to GrabCut if not.
-- Handles missing optional packages gracefully and fixes prior bugs.
+Streamlit app: Photo Processor Pro — enhanced version.
+- Added: flexible input/output paths, format/resolution selection.
+- Improved: UI, error handling, configuration persistence.
 """
 from pathlib import Path
 from datetime import datetime
@@ -129,15 +128,33 @@ def remove_watermark_cv(img_cv: np.ndarray, threshold: int = 220, radius: int = 
         logger.exception("remove_watermark_cv failed")
         return img_cv
 
-def save_image(img_cv: np.ndarray, out_path: Path, fmt: str, jpeg_quality: int = 95):
+def resize_image(img_cv: np.ndarray, target_width: int, target_height: int):
+    """Resize image to target dimensions."""
+    return cv2.resize(img_cv, (target_width, target_height), interpolation=cv2.INTER_AREA)
+
+def save_image(
+    img_cv: np.ndarray,
+    out_path: Path,
+    fmt: str,
+    jpeg_quality: int = 95,
+    target_width: int = None,
+    target_height: int = None
+):
     try:
+        # Apply resize if specified
+        if target_width and target_height:
+            img_cv = resize_image(img_cv, target_width, target_height)
+
         out_path.parent.mkdir(parents=True, exist_ok=True)
+        
         if fmt.startswith("PNG") and img_cv.shape[2] == 4:
             cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 3])
             return True
+        
         bgr = img_cv
         if img_cv.shape[2] == 4:
             bgr = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2BGR)
+        
         success, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), int(jpeg_quality)])
         if success:
             out_path.write_bytes(buf.tobytes())
@@ -195,21 +212,71 @@ def main():
     if "logs" not in st.session_state:
         st.session_state.logs = []
 
+
     with st.sidebar:
         st.header("Настройки")
-        input_dir = st.text_input("Входная папка", value="./input")
-        output_dir = st.text_input("Выходная папка", value="./output")
+        
+        # Ввод путей
+        input_dir = st.text_input(
+            "Входная папка", 
+            value="./input",
+            help="Укажите путь к папке с исходными изображениями"
+        )
+        output_dir = st.text_input(
+            "Выходная папка",
+            value="./output",
+            help="Укажите путь к папке для сохранения обработанных изображений"
+        )
+        
         st.markdown("---")
+        
+        # Настройки обработки
         remove_bg = st.checkbox("Удалить фон (rembg если доступен)", value=True)
         if remove_bg and not HAS_REMBG:
             st.caption("rembg не установлен — используется fallback (GrabCut).")
+        
+        
         remove_wm = st.checkbox("Удалить водяные знаки (inpaint)", value=False)
         if remove_wm:
             wm_radius = st.slider("Радиус inpaint", 1, 25, 5)
             wm_threshold = st.slider("Порог яркости для маски", 120, 255, 220)
+        
+        
         st.markdown("---")
-        fmt = st.radio("Формат вывода", ("PNG (с альфа)", "JPEG (без альфа)"))
-        jpeg_q = st.slider("Качество JPEG (%)", 50, 100, 95) if fmt.startswith("JPEG") else 95
+        
+        # Выбор формата
+        fmt = st.radio(
+            "Формат вывода",
+            ("PNG (с альфа)", "JPEG (без альфа)"),
+            help="Выберите формат сохраняемых изображений"
+        )
+        
+        jpeg_q = 95
+        if fmt.startswith("JPEG"):
+            jpeg_q = st.slider("Качество JPEG (%)", 50, 100, 95)
+        
+        
+        st.markdown("---")
+        
+        # Настройка разрешения
+        resize_option = st.selectbox(
+            "Изменение размера",
+            ("Оригинал", "Задать ширину", "Задать высоту", "Задать оба параметра"),
+            help="Выберите способ изменения размера изображения"
+        )
+        
+        target_width = None
+        target_height = None
+        
+        if resize_option == "Задать ширину":
+            target_width = st.number_input("Ширина (пиксели)", min_value=1, value=1920)
+        elif resize_option == "Задать высоту":
+            target_height = st.number_input("Высота (пиксели)", min_value=1, value=1080)
+        elif resize_option == "Задать оба параметра":
+            target_width = st.number_input("Ширина (пиксели)", min_value=1, value=1920)
+            target_height = st.number_input("Высота (пиксели)", min_value=1, value=1080)
+        
+        
         st.markdown("---")
         run = st.button("🚀 Запустить обработку")
 
@@ -255,7 +322,10 @@ def main():
 
                 out_name = p.stem + (".png" if fmt.startswith("PNG") else ".jpg")
                 out_path = outp / out_name
-                saved = save_image(img_cv, out_path, fmt, jpeg_q)
+                saved = save_image(
+                    img_cv, out_path, fmt, jpeg_q,
+                    target_width, target_height
+                )
 
                 if saved:
                     log = f"✅ {i+1}/{total}: {p.name} → {out_name}"
@@ -273,17 +343,22 @@ def main():
                     c1.image(orig_disp, caption="Оригинал", use_column_width=True)
                     res_disp = bgr_to_display(img_cv)
                     c2.image(res_disp, caption="Результат", use_column_width=True)
+                    
                     if mask_preview is not None:
-                        c3.image(mask_preview, caption="Маска прозрачности", use_column_width=True)
-                    elif remove_wm:
+                        c3.image(mask_preview, caption="Маска прозрачности", use_column_width
+                                            elif remove_wm:
                         gray = cv2.cvtColor(img_cv[..., :3], cv2.COLOR_BGR2GRAY)
                         _, m = cv2.threshold(gray, wm_threshold, 255, cv2.THRESH_BINARY)
                         c3.image(m, caption="WM маска (порог)", use_column_width=True)
                     else:
                         c3.write("—")
-                    # histogram as image
-                    hist_img = histogram_image_rgb(res_disp[..., :3] if res_disp is not None and res_disp.ndim==3 else None)
+                    
+                    # Гистограмма как изображение
+                    hist_img = histogram_image_rgb(
+                        res_disp[..., :3] if res_disp is not None and res_disp.ndim == 3 else None
+                    )
                     st.image(hist_img, caption="Гистограмма (R/G/B)", use_column_width=False)
+
 
             except UnidentifiedImageError:
                 err = f"❌ {i+1}/{total}: Невозможно открыть {p.name}"
@@ -294,7 +369,9 @@ def main():
                 st.session_state.logs.append(err)
                 logger.error(f"{err}\n{traceback.format_exc()}")
 
+
             progress.progress((i + 1) / total)
+
 
         status.success("Обработка завершена.")
         st.balloons()
@@ -306,6 +383,24 @@ def main():
             st.code("\n".join(st.session_state.logs))
     else:
         st.info("Лог пуст. Запустите обработку.")
+
+    # Блок информации о настройках
+    st.markdown("---")
+    st.subheader("Текущие настройки")
+    settings_info = f"""
+    - Входная папка: `{input_dir}`
+    - Выходная папка: `{output_dir}`
+    - Удаление фона: `{remove_bg}` ({'rembg' if HAS_REMBG and remove_bg else 'GrabCut' if remove_bg else 'отключено'})
+    - Удаление водяных знаков: `{remove_wm}`
+      - Радиус inpaint: `{wm_radius}`
+      - Порог яркости: `{wm_threshold}`
+    - Формат вывода: `{fmt}`
+    - Качество JPEG: `{jpeg_q}%`
+    - Изменение размера: `{resize_option}`
+      - Ширина: `{target_width or 'не задана'}`
+      - Высота: `{target_height or 'не задана'}`
+    """
+    st.text(settings_info)
 
 if __name__ == "__main__":
     main()
