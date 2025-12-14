@@ -1,23 +1,23 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — полная версия (CLI + Streamlit).
-- CLI: интерактивный выбор выходной папки при необходимости.
-- Streamlit: секции слева и настройки справа, сохранение результатов локально и ZIP для скачивания.
-- Удаление фона (rembg если установлен, иначе GrabCut), простое удаление водяных знаков (inpaint).
-- Параллельная обработка (ThreadPool).
+Photo Processor Pro — полная версия (CLI + Streamlit) с исправлениями.
+- Результаты всегда сохраняются в выбранную пользователем выходную папку.
+- ZIP архива создаётся вне выходной папки (в temp dir) и предлагается для скачивания.
+- Устранена ошибка NameError для Optional.
 """
 from pathlib import Path
 from datetime import datetime
 import logging
-import traceback
 import io
 import os
 import sys
 import argparse
 import json
 import shutil
+import tempfile
 from typing import List, Optional, Tuple, Dict, Any
+
 import concurrent.futures as cf
 import multiprocessing as mp
 
@@ -96,6 +96,22 @@ def save_config(config: Dict[str, Any], config_path: str):
             json.dump(config, f, indent=2, ensure_ascii=False)
     except Exception:
         logger.exception("Не удалось сохранить конфигурацию")
+
+# --- Helper: create zip outside output dir ---
+def create_zip_of_output(output_dir: str, zip_name: Optional[str] = None) -> Path:
+    """
+    Create a zip archive of output_dir in the system temp directory to avoid
+    including the archive into itself. Returns Path to created zip.
+    """
+    outp = Path(output_dir).expanduser().resolve()
+    if not outp.exists() or not outp.is_dir():
+        raise FileNotFoundError(f"Output folder not found: {outp}")
+
+    base_name = zip_name or f"{outp.name}_results"
+    tmp_dir = Path(tempfile.gettempdir())
+    zip_base = tmp_dir / base_name
+    zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=str(outp))
+    return Path(zip_path)
 
 # --- Interactive output folder chooser (CLI) ---
 def choose_output_folder(base: str = ".") -> Path:
@@ -231,33 +247,6 @@ def resize_image(img_cv: np.ndarray, target_width: Optional[int], target_height:
         scale = target_height / h
         return cv2.resize(img_cv, (max(1, int(w * scale)), int(target_height)), interpolation=cv2.INTER_AREA)
     return img_cv
-
-def histogram_image_rgb(img_rgb: np.ndarray, size=(256, 120)):
-    w, h = size
-    canvas = np.full((h, w, 3), 30, dtype=np.uint8)
-    if img_rgb is None:
-        return canvas
-    if img_rgb.ndim == 2:
-        hist = cv2.calcHist([img_rgb], [0], None, [256], [0, 256])
-        cv2.normalize(hist, hist, 0, h - 10, cv2.NORM_MINMAX)
-        prev = None
-        for x in range(256):
-            y = h - int(hist[x])
-            if prev is not None:
-                cv2.line(canvas, (x - 1, prev), (x, y), (200, 200, 200), 1)
-            prev = y
-    else:
-        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
-        for ch in range(3):
-            hist = cv2.calcHist([img_rgb], [ch], None, [256], [0, 256])
-            cv2.normalize(hist, hist, 0, h - 10, cv2.NORM_MINMAX)
-            prev = None
-            for x in range(256):
-                y = h - int(hist[x])
-                if prev is not None:
-                    cv2.line(canvas, (x - 1, prev), (x, y), colors[ch], 1)
-                prev = y
-    return canvas
 
 def validate_output_params(outp: Path, fmt: str, target_width: Optional[int], target_height: Optional[int]) -> Tuple[bool, str]:
     try:
@@ -630,11 +619,8 @@ def run_streamlit():
         st.markdown("---")
         run = st.button("🚀 Запустить обработку")
 
-    # Handle uploaded files if chosen
-    uploaded_files = None
-    if st.session_state.get("input_mode") == "Загрузить файлы":
-        # We'll ask user to upload files right before running to ensure they are available
-        pass
+    # Handle uploaded files if chosen: we will ask just before running
+    uploaded_files: Optional[List[Any]] = None
 
     if run:
         input_dir = st.session_state.input_dir
@@ -678,19 +664,17 @@ def run_streamlit():
         with st.expander("Показать лог обработки", expanded=True):
             st.code("\n".join(st.session_state.logs))
 
-        # Create zip of output_dir for download
+        # Create zip OUTSIDE output_dir and offer download
         try:
-            outp = Path(output_dir)
-            zip_base = outp / "results_archive"
-            zip_archive = shutil.make_archive(str(zip_base), 'zip', root_dir=str(outp))
-            with open(zip_archive, "rb") as f:
+            zip_path = create_zip_of_output(output_dir)
+            with open(zip_path, "rb") as f:
                 st.download_button(
                     label="Скачать ZIP с результатами",
                     data=f,
-                    file_name=Path(zip_archive).name,
-                    mime="application/zip"
+                    file_name=zip_path.name,
+                    mime="application/zip",
                 )
-            st.info(f"ZIP создан: {zip_archive}")
+            st.info(f"ZIP создан: {zip_path}")
         except Exception as e:
             st.error(f"Не удалось создать ZIP: {e}")
 
