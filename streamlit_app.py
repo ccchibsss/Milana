@@ -1,12 +1,13 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Исправленная и рабочая версия Photo Processor Pro (CLI + Streamlit)
-Устранены синтаксические и логические ошибки:
-- Опциональные аргументы CLI (используются значения из config.json / defaults)
-- Исправлены ошибки при сохранении/конвертации изображений
-- Корректная обработка альфа-каналов и удаления ватермарок
-- Устранены все явные синтаксические ошибки
+Photo Processor Pro (CLI + Streamlit) — полный рабочий скрипт.
+Поддерживает:
+- CLI (необязательные аргументы, берутся из config.json или defaults)
+- Streamlit-интерфейс (если установлен)
+- Удаление фона (rembg или grabcut fallback)
+- Удаление простых водяных знаков
+- Выбор файла, пакетная обработка и скачивание ZIP результатов
 """
 
 from __future__ import annotations
@@ -15,6 +16,7 @@ import io
 import json
 import logging
 import sys
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -32,7 +34,7 @@ try:
 except Exception as e:
     rembg_remove = None  # type: ignore
     HAS_REMBG = False
-    logging.warning(f"rembg не установлен: {e}")
+    logging.warning("rembg не установлен: %s", e)
 
 try:
     import streamlit as st  # type: ignore
@@ -40,7 +42,7 @@ try:
 except Exception as e:
     st = None  # type: ignore
     HAS_STREAMLIT = False
-    logging.warning(f"Streamlit не установлен: {e}")
+    logging.warning("Streamlit не установлен: %s", e)
 
 # Logger
 def setup_logger() -> logging.Logger:
@@ -59,6 +61,7 @@ logger = setup_logger()
 
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
+
 @dataclass
 class ProcessingConfig:
     remove_bg: bool = True
@@ -71,6 +74,7 @@ class ProcessingConfig:
     target_height: Optional[int] = None
     inp: Path = Path("./input")
     outp: Path = Path("./output")
+
 
 def load_config() -> ProcessingConfig:
     """Загружает config.json или возвращает дефолтные значения."""
@@ -92,13 +96,13 @@ def load_config() -> ProcessingConfig:
     logger.info("Используются дефолтные настройки (config.json не найден)")
     return ProcessingConfig()
 
+
 def validate_path(path: Path, is_input: bool = True) -> Tuple[bool, str]:
     try:
         if is_input:
             if not path.exists() or not path.is_dir():
                 return False, f"Входная папка не найдена или не каталог: {path}"
         else:
-            # Для выходной папки создаём директорию, если нужно
             if not path.exists():
                 path.mkdir(parents=True, exist_ok=True)
             elif not path.is_dir():
@@ -109,8 +113,10 @@ def validate_path(path: Path, is_input: bool = True) -> Tuple[bool, str]:
     except Exception as e:
         return False, f"Ошибка проверки: {e}"
 
+
 def validate_file_extension(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
+
 
 def rembg_background(pil_img: Image.Image) -> Image.Image:
     if not HAS_REMBG or rembg_remove is None:
@@ -121,12 +127,12 @@ def rembg_background(pil_img: Image.Image) -> Image.Image:
             return Image.open(io.BytesIO(out))
         if isinstance(out, Image.Image):
             return out
-        # Если rembg вернул numpy array
         if isinstance(out, np.ndarray):
             return Image.fromarray(out)
     except Exception as e:
         logger.exception("rembg failed: %s", e)
     return pil_img
+
 
 def grabcut_background(pil_img: Image.Image) -> Image.Image:
     try:
@@ -150,6 +156,7 @@ def grabcut_background(pil_img: Image.Image) -> Image.Image:
         logger.exception("grabcut failed: %s", e)
         return pil_img
 
+
 def remove_background(pil_img: Image.Image, config: ProcessingConfig) -> Image.Image:
     if config.remove_bg and HAS_REMBG:
         try:
@@ -158,11 +165,11 @@ def remove_background(pil_img: Image.Image, config: ProcessingConfig) -> Image.I
             logger.warning("rembg failed, fallback to grabcut")
     return grabcut_background(pil_img)
 
+
 def remove_watermark(img_cv: np.ndarray, config: ProcessingConfig) -> np.ndarray:
     if not config.remove_wm:
         return img_cv
     try:
-        # Work on BGR or BGRA
         bgr = img_cv[..., :3].copy()
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         _, thr = cv2.threshold(gray, config.wm_threshold, 255, cv2.THRESH_BINARY)
@@ -174,11 +181,9 @@ def remove_watermark(img_cv: np.ndarray, config: ProcessingConfig) -> np.ndarray
             if cv2.contourArea(c) > 50:
                 cv2.drawContours(mask, [c], -1, 255, -1)
         if np.any(mask):
-            inpainted = cv2.inpaint(bgr, mask, config.wm_radius, cv2.INPAINT_TELEA)
-            # Если исход был 3-канальным
+            inpainted = cv2.inpaint(bgr, mask, int(config.wm_radius), cv2.INPAINT_TELEA)
             if img_cv.ndim == 3 and img_cv.shape[2] == 3:
                 return inpainted
-            # Иначе создаём 4-канальное и восстанавливаем альфу, если она была
             out = cv2.cvtColor(inpainted, cv2.COLOR_BGR2BGRA)
             if img_cv.ndim == 3 and img_cv.shape[2] == 4:
                 out[..., 3] = img_cv[..., 3]
@@ -187,6 +192,7 @@ def remove_watermark(img_cv: np.ndarray, config: ProcessingConfig) -> np.ndarray
     except Exception as e:
         logger.exception("remove_watermark failed: %s", e)
         return img_cv
+
 
 def resize_image(img_cv: np.ndarray, target_width: Optional[int], target_height: Optional[int]) -> np.ndarray:
     if img_cv.ndim == 2:
@@ -197,17 +203,17 @@ def resize_image(img_cv: np.ndarray, target_width: Optional[int], target_height:
     if target_width and target_height:
         return cv2.resize(img_cv, (int(target_width), int(target_height)), interpolation=cv2.INTER_AREA)
     if target_width and target_width > 0:
-        scale = target_width / w
+        scale = float(target_width) / w
         return cv2.resize(img_cv, (int(target_width), max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-    scale = target_height / h
+    scale = float(target_height) / h
     return cv2.resize(img_cv, (max(1, int(w * scale)), int(target_height)), interpolation=cv2.INTER_AREA)
+
 
 def save_image(img_cv: np.ndarray, out_path: Path, config: ProcessingConfig) -> bool:
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         img_cv = resize_image(img_cv, config.target_width, config.target_height)
 
-        # Конвертируем в PIL для сохранения с настройками формата
         if img_cv.ndim == 2:
             pil_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_GRAY2RGB))
         elif img_cv.shape[2] == 4:
@@ -226,6 +232,7 @@ def save_image(img_cv: np.ndarray, out_path: Path, config: ProcessingConfig) -> 
         logger.error("Не удалось сохранить изображение %s: %s", out_path, e)
         return False
 
+
 def process_image(in_path: Path, out_path: Path, config: ProcessingConfig) -> Tuple[bool, str]:
     try:
         pil_img = Image.open(in_path)
@@ -235,14 +242,12 @@ def process_image(in_path: Path, out_path: Path, config: ProcessingConfig) -> Tu
         if img_cv.ndim == 2:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2BGR)
         elif img_cv.shape[2] == 3:
-            # PIL gives RGB
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
         elif img_cv.shape[2] == 4:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGBA2BGRA)
 
         img_cv = remove_watermark(img_cv, config)
 
-        # Ensure output filename extension matches desired format
         out_path = out_path.with_suffix(f".{config.fmt.lower()}")
         if save_image(img_cv, out_path, config):
             return True, ""
@@ -253,6 +258,7 @@ def process_image(in_path: Path, out_path: Path, config: ProcessingConfig) -> Tu
     except Exception as e:
         logger.exception("Ошибка обработки %s: %s", in_path, e)
         return False, f"Ошибка: {in_path} — {str(e)}"
+
 
 def process_batch(input_dir: Path, output_dir: Path, config: ProcessingConfig, max_workers: int = 4) -> List[Tuple[Path, bool, str]]:
     results: List[Tuple[Path, bool, str]] = []
@@ -276,6 +282,21 @@ def process_batch(input_dir: Path, output_dir: Path, config: ProcessingConfig, m
             except Exception as e:
                 results.append((in_path, False, str(e)))
     return results
+
+
+def _zip_results_bytes(output_dir: Path, results: List[Tuple[Path, bool, str]], fmt: str) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for in_path, success, _ in results:
+            if not success:
+                continue
+            out_name = f"{in_path.stem}.{fmt.lower()}"
+            out_path = output_dir / out_name
+            if out_path.exists() and out_path.is_file():
+                z.write(out_path, arcname=out_name)
+    buf.seek(0)
+    return buf.read()
+
 
 def run_cli(argv: Optional[List[str]] = None):
     parser = argparse.ArgumentParser(description="Обработка изображений")
@@ -319,6 +340,7 @@ def run_cli(argv: Optional[List[str]] = None):
         else:
             print(f"✗ {path.name}: {msg}")
 
+
 def run_streamlit():
     if st is None:
         raise RuntimeError("Streamlit не доступен")
@@ -326,8 +348,8 @@ def run_streamlit():
     st.write("Обработка изображений: удаление фона, водяных знаков, изменение размера.")
 
     config = load_config()
-    input_dir = st.sidebar.text_input("Входная папка", value=str(config.inp))
-    output_dir = st.sidebar.text_input("Выходная папка", value=str(config.outp))
+    input_dir = Path(st.sidebar.text_input("Входная папка", value=str(config.inp)))
+    output_dir = Path(st.sidebar.text_input("Выходная папка", value=str(config.outp)))
 
     remove_bg = st.sidebar.checkbox("Удалить фон", value=config.remove_bg)
     remove_wm = st.sidebar.checkbox("Удалить водяные знаки", value=config.remove_wm)
@@ -337,56 +359,103 @@ def run_streamlit():
     target_height = st.sidebar.number_input("Высота (px)", value=int(config.target_height or 0), min_value=0, step=10)
     workers = st.sidebar.number_input("Потоки", value=4, min_value=1, step=1)
 
-    if st.button("Запустить обработку"):
-        config.inp = Path(input_dir)
-        config.outp = Path(output_dir)
-        config.remove_bg = remove_bg
-        config.remove_wm = remove_wm
-        config.fmt = fmt
-        config.jpeg_q = int(jpeg_q)
-        config.target_width = int(target_width) if target_width > 0 else None
-        config.target_height = int(target_height) if target_height > 0 else None
+    st.sidebar.markdown("---")
+    st.sidebar.write("Файлы в входной папке:")
+    if not input_dir.exists() or not input_dir.is_dir():
+        st.sidebar.error("Входная папка не найдена или не каталог")
+        file_list = []
+    else:
+        file_list = sorted([p for p in input_dir.iterdir() if p.is_file() and validate_file_extension(p)], key=lambda p: p.name)
+        if not file_list:
+            st.sidebar.info("Нет изображений в папке")
 
-        valid, msg = validate_path(config.inp, is_input=True)
+    file_names = [p.name for p in file_list]
+    selected = st.sidebar.selectbox("Выбрать файл для обработки", options=["(выбрать)"] + file_names, index=0)
+
+    if st.button("Обработать выбранный файл") and selected and selected != "(выбрать)":
+        cfg = ProcessingConfig(**vars(config))
+        cfg.inp = input_dir
+        cfg.outp = output_dir
+        cfg.remove_bg = remove_bg
+        cfg.remove_wm = remove_wm
+        cfg.fmt = fmt
+        cfg.jpeg_q = int(jpeg_q)
+        cfg.target_width = int(target_width) if target_width > 0 else None
+        cfg.target_height = int(target_height) if target_height > 0 else None
+
+        valid, msg = validate_path(cfg.inp, is_input=True)
         if not valid:
             st.error(msg)
-            return
-        valid, msg = validate_path(config.outp, is_input=False)
-        if not valid:
-            st.error(msg)
-            return
-
-        st.info("Начинается обработка изображений...")
-        results = process_batch(config.inp, config.outp, config, max_workers=int(workers))
-
-        success_count = sum(1 for _, success, _ in results if success)
-        fail_count = len(results) - success_count
-
-        if success_count > 0:
-            st.success(f"Обработано успешно: {success_count} файлов")
-        if fail_count > 0:
-            st.error(f"Ошибок: {fail_count} файлов")
-
-        for path, success, msg in results:
-            if not success:
-                st.warning(f"{path.name}: {msg}")
-
-        if success_count > 0:
-            st.subheader("Обработанные файлы:")
-            for path, success, _ in results:
-                if success:
+        else:
+            valid, msg = validate_path(cfg.outp, is_input=False)
+            if not valid:
+                st.error(msg)
+            else:
+                in_path = input_dir / selected
+                out_path = cfg.outp / f"{in_path.stem}.{cfg.fmt.lower()}"
+                st.info(f"Обработка {selected} ...")
+                ok, msg = process_image(in_path, out_path, cfg)
+                if ok and out_path.exists():
+                    st.success("Готово")
                     try:
-                        img = Image.open(config.outp / (path.stem + f".{config.fmt.lower()}"))
-                        st.image(img, caption=path.name, use_column_width=True)
+                        with open(out_path, "rb") as f:
+                            data = f.read()
+                        st.image(out_path, caption=out_path.name, use_column_width=True)
+                        st.download_button("Скачать результат", data, file_name=out_path.name, mime="application/octet-stream")
                     except Exception as e:
-                        st.write(f"Не удалось отобразить {path.name}: {e}")
+                        st.error(f"Не удалось отобразить/скачать результат: {e}")
+                else:
+                    st.error(f"Ошибка обработки: {msg}")
+
+    if st.button("Обработать все и скачать ZIP"):
+        cfg = ProcessingConfig(**vars(config))
+        cfg.inp = input_dir
+        cfg.outp = output_dir
+        cfg.remove_bg = remove_bg
+        cfg.remove_wm = remove_wm
+        cfg.fmt = fmt
+        cfg.jpeg_q = int(jpeg_q)
+        cfg.target_width = int(target_width) if target_width > 0 else None
+        cfg.target_height = int(target_height) if target_height > 0 else None
+
+        valid, msg = validate_path(cfg.inp, is_input=True)
+        if not valid:
+            st.error(msg)
+        else:
+            valid, msg = validate_path(cfg.outp, is_input=False)
+            if not valid:
+                st.error(msg)
+            else:
+                st.info("Запущена пакетная обработка...")
+                results = process_batch(cfg.inp, cfg.outp, cfg, max_workers=int(workers))
+                success_count = sum(1 for _, ok, _ in results if ok)
+                fail_count = len(results) - success_count
+
+                st.write(f"Успешно: {success_count}, Ошибок: {fail_count}")
+                if success_count > 0:
+                    zip_bytes = _zip_results_bytes(cfg.outp, results, cfg.fmt)
+                    st.download_button("Скачать все результаты (ZIP)", zip_bytes, file_name=f"results_{cfg.fmt.lower()}.zip", mime="application/zip")
+                for p, ok, msg in results:
+                    if not ok:
+                        st.warning(f"{p.name}: {msg}")
+
+    st.markdown("---")
+    st.write("Предпросмотр (без обработки)")
+    if selected and selected != "(выбрать)":
+        try:
+            img = Image.open(input_dir / selected)
+            st.image(img, caption=f"Исходник: {selected}", use_column_width=True)
+        except Exception as e:
+            st.write(f"Не удалось открыть {selected}: {e}")
+
 
 def main(argv: Optional[List[str]] = None):
-    # Если Streamlit доступен и мы запускаемся под streamlit, используем интерфейс
+    # Если запускается через streamlit (streamlit imports the module), используем UI
     if HAS_STREAMLIT and "streamlit" in sys.modules:
         run_streamlit()
     else:
         run_cli(argv)
+
 
 if __name__ == "__main__":
     main()
