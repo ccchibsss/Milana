@@ -1,15 +1,18 @@
 """
-Исправленный Photo Processor Pro — полный скрипт.
-Поправлено:
+Исправленный Photo Processor Pro — полный скрипт с интерактивным выбором файлов из папок.
+
+Поправлено/добавлено:
 - не вызывать SystemExit при отсутствии --input; по умолчанию используется текущая папка;
 - корректная обработка --create-test (создаёт тесты и продолжает работу);
 - правильная интерпретация workers (0/1 = последовательная);
 - общие устойчивые проверки наличия пакетов/модулей;
-- небольшие защитные фиксы при отсутствии cv2/rembg/tqdm.
+- небольшие защитные фиксы при отсутствии cv2/rembg/tqdm;
+- возможность интерактивно выбирать файлы из указанных папок (--pick-files). В неинтерактивном режиме
+  --pick-files автоматически выбирает все файлы в папках.
 """
 from pathlib import Path
 from datetime import datetime
-import argparse, logging, sys, os, csv, html, time, traceback
+import argparse, logging, sys, os, csv, html, time, traceback, re
 from io import BytesIO
 from typing import List, Optional, Dict, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -61,17 +64,24 @@ def setup_logger(out_dir: Optional[Path] = None, level=logging.INFO) -> logging.
     return logger
 
 def list_images_in_dirs(dirs: List[Path], recursive: bool = False) -> List[Path]:
+    """Accepts paths that may be files or directories. Returns list of image files."""
     out = []
     for d in dirs:
-        if not d.exists() or not d.is_dir():
-            continue
-        it = d.rglob("*") if recursive else d.iterdir()
-        for p in it:
-            try:
-                if p.is_file() and p.suffix.lower() in IMG_EXTS:
-                    out.append(p)
-            except Exception:
+        try:
+            if d.exists() and d.is_file() and d.suffix.lower() in IMG_EXTS:
+                out.append(d)
                 continue
+            if not d.exists() or not d.is_dir():
+                continue
+            it = d.rglob("*") if recursive else d.iterdir()
+            for p in it:
+                try:
+                    if p.is_file() and p.suffix.lower() in IMG_EXTS:
+                        out.append(p)
+                except Exception:
+                    continue
+        except Exception:
+            continue
     return sorted(out, key=lambda p: p.as_posix())
 
 def compute_output_base(original: Path, out_root: Path, mode: str, input_roots: List[Path], suffix: str = "_proc") -> Path:
@@ -177,7 +187,10 @@ def save_cv_image(img_cv: np.ndarray, out_base: Path, fmt: str, jpeg_q: int = 95
     if fmt.upper().startswith("PNG"):
         out_path = out_base.with_suffix(".png")
         if cv2 is not None and isinstance(img_cv, np.ndarray) and img_cv.ndim == 3 and img_cv.shape[2] == 4:
-            cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+            try:
+                cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+            except Exception:
+                cv_to_pil(img_cv).save(out_path, format="PNG")
         else:
             cv_to_pil(img_cv).save(out_path, format="PNG")
         return out_path
@@ -358,6 +371,49 @@ def save_html_report(out_root: Path, records: List[Dict[str,Any]], title: str="�
     html_doc = f"<!doctype html><html><head><meta charset='utf-8'><title>{html.escape(title)}</title><style>body{{font-family:Arial}}table{{border-collapse:collapse}}td,th{{border:1px solid #ddd;padding:6px}}</style></head><body><h1>{html.escape(title)}</h1><p>Сгенерировано: {now}</p><table><tr><th>имя</th><th>статус</th><th>попытки</th><th>время(с)</th><th>ошибка</th><th>файл</th><th>превью</th></tr>{''.join(rows)}</table></body></html>"
     html_path.write_text(html_doc, encoding="utf-8"); return html_path
 
+# ---------------- interactive file picker ---------------------------------
+def parse_selection(s: str, n: int) -> List[int]:
+    """Accepts '1,2,5-8' or 'a'/'all' -> 0-based indices"""
+    s = (s or "").strip().lower()
+    if not s: return []
+    if s in ("a", "all"): return list(range(n))
+    parts = re.split(r"[,\s]+", s)
+    idxs = set()
+    for part in parts:
+        if not part: continue
+        if "-" in part:
+            try:
+                a,b = part.split("-",1); ia,ib = int(a)-1,int(b)-1
+                ia = max(0, ia); ib = min(n-1, ib)
+                for i in range(min(ia,ib), max(ia,ib)+1): idxs.add(i)
+            except Exception:
+                continue
+        else:
+            if part.isdigit():
+                i = int(part)-1
+                if 0 <= i < n: idxs.add(i)
+    return sorted(idxs)
+
+def ask_select_files_in_folder(folder: Path, recursive: bool=False) -> List[Path]:
+    if not folder.exists() or not folder.is_dir():
+        return []
+    files = sorted([p for p in (folder.rglob("*") if recursive else folder.iterdir()) if p.is_file() and p.suffix.lower() in IMG_EXTS], key=lambda p: p.name)
+    if not files:
+        print(f"  (no image files in {folder})")
+        return []
+    print(f"\nFiles in {folder}:")
+    for i, f in enumerate(files, 1):
+        print(f"  {i:3d}) {f.name}")
+    print("Select by numbers, ranges or 'a' for all (e.g. '1,3,5-8' ; enter to skip):")
+    try:
+        s = input("Selection: ").strip()
+    except Exception:
+        s = ""
+    if not s:
+        return []
+    idxs = parse_selection(s, len(files))
+    return [files[i] for i in idxs]
+
 # ---------------- CLI / main ------------------------------------------------
 def parse_args():
     p = argparse.ArgumentParser(description="Photo Processor Pro — полный скрипт")
@@ -365,6 +421,7 @@ def parse_args():
     p.add_argument("-o","--output", default="./output", help="выходная папка")
     p.add_argument("-r","--recursive", action="store_true", help="искать рекурсивно")
     p.add_argument("--create-test", action="store_true", help="создать тестовые изображения в первой входной папке")
+    p.add_argument("--pick-files", action="store_true", help="интерактивно выбрать файлы из входных папок (или auto-all в non-tty)")
     p.add_argument("--no-bg", dest="remove_bg", action="store_false", help="не удалять фон")
     p.set_defaults(remove_bg=True)
     p.add_argument("--wm", dest="remove_wm", action="store_true", help="удалять водяные знаки (простой метод)")
@@ -395,22 +452,23 @@ def create_test_images(out_dir: Path, count: int = 3):
         fn = out_dir / f"test_{i+1}.png"
         im = Image.new("RGB", (800,600), (200,200,200))
         d = ImageDraw.Draw(im)
-        d.text((20,20), f"Test {i+1} {datetime.now().isoformat(timespec='seconds')}", fill=(10,10,10))
+        try:
+            d.text((20,20), f"Test {i+1} {datetime.now().isoformat(timespec='seconds')}", fill=(10,10,10))
+        except Exception:
+            pass
         im.save(fn); created.append(fn)
     return created
 
 def main():
     args = parse_args()
     input_roots = [Path(x) for x in (args.input or [])]
-    # Если не передали --input:
+    # default to cwd if nothing passed
     if not input_roots:
         if args.create_test:
-            # создаём тесты в cwd and use cwd as input
             target = Path.cwd()
-            created = create_test_images(target, count=3)
+            create_test_images(target, count=3)
             input_roots = [target]
         else:
-            # по умолчанию используем текущую папку, не завершаем с ошибкой
             input_roots = [Path.cwd()]
 
     out_root = Path(args.output)
@@ -423,20 +481,39 @@ def main():
     logger = setup_logger(out_root if not args.dry_run else None)
     logger.info("Запуск: input=%s output=%s", input_roots, out_root)
 
-    images = list_images_in_dirs(input_roots, recursive=args.recursive)
-    if not images:
-        logger.info("Изображений не найдено в указанных папках: %s", ", ".join(str(p) for p in input_roots))
-        # если --create-test было указано, попробуем создать в первой папке
-        if args.create_test:
-            target = input_roots[0]
-            created = create_test_images(target, count=3)
-            logger.info("Создано тестовых изображений: %d в %s", len(created), target)
+    images: List[Path] = []
+    # If pick-files requested -> interactive selection (or auto-all if non-tty)
+    if args.pick_files:
+        logger.info("File picking mode (--pick-files).")
+        if not sys.stdin.isatty():
+            # non-interactive: auto-select all images found
             images = list_images_in_dirs(input_roots, recursive=args.recursive)
             if not images:
-                logger.info("После создания тестов изображений всё ещё нет. Выход.")
-                return
+                logger.info("No images found in input folders for auto-selection: %s", ", ".join(str(p) for p in input_roots))
         else:
-            return
+            # interactive: ask per folder
+            for d in input_roots:
+                picks = ask_select_files_in_folder(d, recursive=args.recursive)
+                images.extend(picks)
+    else:
+        # default behavior: gather files & dirs (accept files passed directly)
+        images = list_images_in_dirs(input_roots, recursive=args.recursive)
+
+    # if no images and create-test requested -> create tests and re-scan
+    if not images and args.create_test:
+        target = input_roots[0]
+        created = create_test_images(target, count=3)
+        logger.info("Создано тестовых изображений: %d в %s", len(created), target)
+        if args.pick_files and sys.stdin.isatty():
+            for d in input_roots:
+                picks = ask_select_files_in_folder(d, recursive=args.recursive)
+                images.extend(picks)
+        else:
+            images = list_images_in_dirs(input_roots, recursive=args.recursive)
+
+    if not images:
+        logger.info("Изображений не найдено в указанных папках: %s", ", ".join(str(p) for p in input_roots))
+        return
 
     logger.info("Найдено %d изображений. REMBG_AVAILABLE=%s cv2=%s", len(images), REMBG_AVAILABLE, cv2 is not None)
     fmt_str = args.fmt.upper()
