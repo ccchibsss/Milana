@@ -1,13 +1,9 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — объединённая версия:
-- Работает в Streamlit (если установлен) или в CLI режиме.
-- Поддерживает выбор файлов для обработки и выбор папки сохранения.
-- Использует rembg (если доступен) или GrabCut (фоллбек).
-- Удаление водяных знаков через простую inpaint-эвристику.
-- Превью: гистограмма + маска, логирование.
-Комментарии и сообщения на русском.
+Photo Processor Pro — объединённая версия с интерактивным выбором папки для сохранения (CLI).
+- Streamlit UI остаётся без изменений.
+- В CLI: если --output не указан, вызывается интерактивный помощник choose_output_folder.
 """
 from pathlib import Path
 from datetime import datetime
@@ -23,7 +19,7 @@ import numpy as np
 import cv2
 from PIL import Image, UnidentifiedImageError
 
-# Опционально: rembg
+# optional rembg
 try:
     from rembg import remove as rembg_remove  # type: ignore
     HAS_REMBG = True
@@ -31,7 +27,7 @@ except Exception:
     rembg_remove = None
     HAS_REMBG = False
 
-# Опционально: streamlit
+# optional streamlit
 try:
     import streamlit as st  # type: ignore
     HAS_STREAMLIT = True
@@ -39,7 +35,7 @@ except Exception:
     st = None  # type: ignore
     HAS_STREAMLIT = False
 
-# Логгер
+# logger
 def setup_logger():
     fn = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
     logging.basicConfig(
@@ -51,7 +47,65 @@ def setup_logger():
 
 logger = setup_logger()
 
-# --- Утилиты ---
+# --- interactive helper для выбора/создания выходной папки (CLI) ---
+def choose_output_folder(base: str = ".") -> Path:
+    base_p = Path(base).expanduser().resolve()
+    if not base_p.exists():
+        try:
+            base_p.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise SystemExit(f"Не удалось создать базовую папку '{base_p}': {e}")
+    # список: сначала сам base, затем его прямые поддиректории
+    dirs = [base_p] + sorted([p for p in base_p.iterdir() if p.is_dir() and p != base_p])
+    while True:
+        print(f"\nБаза для выбора: {base_p}")
+        print("Доступные каталоги:")
+        for i, d in enumerate(dirs, start=1):
+            print(f"  {i:2d}. {d}")
+        print("  0. Ввести путь вручную")
+        print("  c. Создать новую папку внутри базы")
+        choice = input("Выберите номер, 0, c или Q для выхода: ").strip().lower()
+        if choice == "q":
+            raise SystemExit("Выход по запросу пользователя.")
+        if choice == "0":
+            p = Path(input("Введите путь (абсолютный или относительный): ").strip()).expanduser().resolve()
+            if p.exists() and p.is_dir():
+                print(f"Выбрана папка: {p}")
+                return p
+            create = input(f"Папка '{p}' не существует. Создать её? (y/N): ").strip().lower()
+            if create == "y":
+                try:
+                    p.mkdir(parents=True, exist_ok=True)
+                    print(f"Папка создана и выбрана: {p}")
+                    return p
+                except Exception as e:
+                    print(f"Не удалось создать папку: {e}")
+            continue
+        if choice == "c":
+            name = input("Имя новой папки внутри базы: ").strip()
+            if not name:
+                print("Имя не указано.")
+                continue
+            p = base_p / name
+            try:
+                p.mkdir(parents=True, exist_ok=True)
+                print(f"Папка создана и выбрана: {p}")
+                return p
+            except Exception as e:
+                print(f"Не удалось создать папку: {e}")
+            continue
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(dirs):
+                selected = dirs[idx - 1]
+                print(f"Выбрана папка: {selected}")
+                return selected
+            else:
+                print("Неверный номер. Попробуйте ещё.")
+        except ValueError:
+            print("Неверный ввод. Введите номер, 0, c или Q.")
+
+# --- Утилиты и основная логика (без изменений) ---
 def get_image_files(inp: Path) -> List[Path]:
     exts = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
     if not inp.exists() or not inp.is_dir():
@@ -198,8 +252,6 @@ def histogram_image_rgb(img_rgb: np.ndarray, size=(256, 120)):
                 prev = y
     return canvas
 
-# --- Основная функция обработки: поддерживает выбор файлов и загруженные файлы
-# ---
 def process_batch(input_dir: str,
                   output_dir: str,
                   remove_bg: bool = True,
@@ -213,15 +265,10 @@ def process_batch(input_dir: str,
                   selected_filenames: Optional[List[str]] = None,
                   uploaded_files: Optional[List[Tuple[str, bytes]]] = None,
                   show_preview: bool = False) -> List[str]:
-    """
-    selected_filenames: список имён файлов в input_dir (если нужно обработать подмножество).
-    uploaded_files: список (имя, bytes) — если пользователь загрузил файлы через UI.
-    """
     inp = Path(input_dir)
     outp = Path(output_dir)
     logs: List[str] = []
 
-    # Если входной папки нет — создаём и просим пользователя положить туда файлы.
     if not inp.exists():
         try:
             inp.mkdir(parents=True, exist_ok=True)
@@ -233,7 +280,6 @@ def process_batch(input_dir: str,
 
     outp.mkdir(parents=True, exist_ok=True)
 
-    # Формируем задания: приоритет — uploaded_files, иначе файлы с диска (возможно фильтрация)
     tasks = []
     if uploaded_files:
         for name, data in uploaded_files:
@@ -285,7 +331,6 @@ def process_batch(input_dir: str,
             msg = f"{'✅' if saved else '❌'} {i}/{total}: {name} -> {out_name}"
             logger.info(msg); logs.append(msg)
 
-            # Сохраняем превьюы (гистограмма и маска) для CLI/проверки
             try:
                 disp = bgr_to_display(img_cv)
                 hist_img = histogram_image_rgb(disp[..., :3] if disp is not None and disp.ndim == 3 else None)
@@ -306,11 +351,11 @@ def process_batch(input_dir: str,
 
     return logs
 
-# --- CLI: добавлена опция --files для подмножества ---
+# --- CLI: теперь --output по умолчанию отсутствует -> интерактивный выбор
 def run_cli(argv=None):
     parser = argparse.ArgumentParser(description="Photo Processor Pro (CLI)")
     parser.add_argument("--input", "-i", default="./input", help="Папка с изображениями")
-    parser.add_argument("--output", "-o", default="./output", help="Куда сохранять")
+    parser.add_argument("--output", "-o", default=None, help="Куда сохранять (если не указано — спросят)")
     parser.add_argument("--no-bg", dest="remove_bg", action="store_false", help="Отключить удаление фона")
     parser.add_argument("--wm", dest="remove_wm", action="store_true", help="Включить удаление водяных знаков")
     parser.add_argument("--wm-threshold", type=int, default=220)
@@ -324,8 +369,6 @@ def run_cli(argv=None):
     args = parser.parse_args(argv)
 
     inp = Path(args.input).expanduser().resolve()
-    outp = Path(args.output).expanduser().resolve()
-    # Создадим input если нет (поведение как раньше)
     if not inp.exists():
         try:
             inp.mkdir(parents=True, exist_ok=True)
@@ -334,7 +377,13 @@ def run_cli(argv=None):
         except Exception:
             msg = f"Не удалось создать входную папку '{inp}'. Проверьте права."
             print(msg); logger.error(msg); return
-    outp.mkdir(parents=True, exist_ok=True)
+
+    if args.output:
+        outp = Path(args.output).expanduser().resolve()
+        outp.mkdir(parents=True, exist_ok=True)
+    else:
+        # интерактивный выбор базируeм на текущей рабочей директории
+        outp = choose_output_folder(base=".")
 
     selected = [s.strip() for s in args.files.split(",")] if args.files else None
 
@@ -355,8 +404,7 @@ def run_cli(argv=None):
     )
     print("\n".join(logs))
 
-# --- Streamlit UI: выбор файлов из папки или загрузка + выбор куда сохранять
-# ---
+# --- Streamlit UI (без изменений) ---
 def run_streamlit():
     st.set_page_config(page_title="Photo Processor Pro", layout="wide")
     st.title("🖼️ Photo Processor Pro — выбор файлов и папки сохранения")
@@ -444,7 +492,6 @@ def run_streamlit():
         for l in logs:
             st.session_state.logs.append(l)
         st.success("Готово. Проверьте папку сохранения.")
-        # не принудительно перезапускаем, просто показываем результаты
 
     st.markdown("---")
     st.subheader("Журнал")
@@ -454,7 +501,7 @@ def run_streamlit():
     else:
         st.info("Лог пуст. Запустите обработку.")
 
-# Точка входа: Streamlit если доступен, иначе CLI
+# entrypoint
 def main():
     if HAS_STREAMLIT:
         run_streamlit()
