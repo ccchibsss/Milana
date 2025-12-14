@@ -55,14 +55,12 @@ class Config:
     custom_save_folder: Optional[Path] = None
 
     def validate(self):
-        # Создаем папки, если их нет
         if not self.input_dir.exists():
             print(f"Папка входных изображений не найдена, создаем: {self.input_dir}")
             self.input_dir.mkdir(parents=True, exist_ok=True)
         elif not self.input_dir.is_dir():
             raise ValueError(f"Путь входных изображений не папка: {self.input_dir}")
 
-        # Создаем папку для сохранения, если нужно
         if self.save_in_custom_folder and self.custom_save_folder:
             if not self.custom_save_folder.exists():
                 print(f"Создаем папку для сохранения: {self.custom_save_folder}")
@@ -168,7 +166,6 @@ def resize_image(img_cv: np.ndarray, target_w: Optional[int], target_h: Optional
 
 def save_image(img_cv: np.ndarray, out_path: Path, config: Config) -> bool:
     try:
-        # Проверка размеров
         if config.target_width and (config.target_width <= 0 or config.target_width > 10000):
             logger.error(f"Недопустимая ширина: {config.target_width}")
             return False
@@ -176,18 +173,13 @@ def save_image(img_cv: np.ndarray, out_path: Path, config: Config) -> bool:
             logger.error(f"Недопустимая высота: {config.target_height}")
             return False
 
-        # Создать папку
         out_path.parent.mkdir(parents=True, exist_ok=True)
-
-        # Изменение размера
         img_cv = resize_image(img_cv, config.target_width, config.target_height)
 
-        # Сохранение
         if config.fmt.upper() == "PNG":
             cv2.imwrite(str(out_path), img_cv, [cv2.IMWRITE_PNG_COMPRESSION, 3])
             return True
         else:
-            # JPEG
             bgr = img_cv
             if img_cv.ndim == 3 and img_cv.shape[2] == 4:
                 bgr = cv2.cvtColor(img_cv, cv2.COLOR_BGRA2BGR)
@@ -200,12 +192,10 @@ def save_image(img_cv: np.ndarray, out_path: Path, config: Config) -> bool:
         logger.exception("Ошибка сохранения")
         return False
 
-# --- Проверка расширения файла ---
 SUPPORTED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 def validate_file_extension(path: Path) -> bool:
     return path.suffix.lower() in SUPPORTED_EXTENSIONS
 
-# --- Обработка одной задачи ---
 def process_single_task(task: Tuple[str, str, Any], config: Config) -> str:
     name, src_type, payload = task
     try:
@@ -220,15 +210,9 @@ def process_single_task(task: Tuple[str, str, Any], config: Config) -> str:
                 buf = data
             pil_img = Image.open(io.BytesIO(buf)).convert("RGBA")
 
-        # Обработка фона
         processed_pil = remove_background(pil_img, config)
-
-        # Конвертация в OpenCV
         img_cv = cv2.cvtColor(np.array(processed_pil), cv2.COLOR_RGBA2BGRA)
-
-        # Удаление водяных знаков
         img_cv = remove_watermark(img_cv, config)
-
         ext = ".png" if config.fmt.upper() == "PNG" else ".jpg"
         out_name = Path(name).stem + ext
         out_path = config.output_dir / out_name
@@ -243,7 +227,6 @@ def process_single_task(task: Tuple[str, str, Any], config: Config) -> str:
         logger.exception(f"Ошибка обработки {name}")
         return f"❌ Ошибка обработки {name}"
 
-# --- Обработка батчей с многопроцессорностью ---
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def process_batch(
@@ -251,19 +234,16 @@ def process_batch(
     filenames: Optional[List[str]] = None,
     uploaded_files: Optional[List[Any]] = None
 ) -> List[str]:
-    # Валидация путей
     config.validate()
 
     tasks: List[Tuple[str, str, Any]] = []
 
-    # Обработка загруженных файлов (если есть)
     if uploaded_files:
         for f in uploaded_files:
             name = getattr(f, "name", None)
             if name and validate_file_extension(Path(name)):
                 tasks.append((name, "uploaded", f))
     else:
-        # Обработка файлов на диске
         for p in config.input_dir.iterdir():
             if p.is_file() and validate_file_extension(p):
                 if not filenames or p.name in filenames:
@@ -287,7 +267,6 @@ def process_batch(
                 logs.append("❌ В процессе возникла ошибка")
     return logs
 
-# --- Создание ZIP архива ---
 def create_zip_of_output(output_dir: str, zip_name: Optional[str] = None) -> Path:
     outp = Path(output_dir).expanduser().resolve()
     if not outp.exists() or not outp.is_dir():
@@ -298,7 +277,6 @@ def create_zip_of_output(output_dir: str, zip_name: Optional[str] = None) -> Pat
     zip_path = shutil.make_archive(str(zip_base), "zip", root_dir=str(outp))
     return Path(zip_path)
 
-# --- CLI интерфейс ---
 def run_cli():
     parser = argparse.ArgumentParser(description="Photo Processor Pro CLI")
     parser.add_argument("--input", "-i", default="./input", help="Папка с изображениями")
@@ -312,10 +290,8 @@ def run_cli():
     parser.add_argument("--width", type=int, default=None, help="Ширина")
     parser.add_argument("--height", type=int, default=None, help="Высота")
     parser.add_argument("--config", default="config.json", help="Путь к файлу конфигурации")
-
     args = parser.parse_args()
 
-    # Загрузка конфигурации из файла (если есть)
     cfg_data = {}
     try:
         with open(args.config, "r", encoding="utf-8") as f:
@@ -345,7 +321,6 @@ def run_cli():
     logs = process_batch(config)
     for log in logs:
         print(log)
-    # Создаем архив и выводим путь
     try:
         zip_path = create_zip_of_output(str(config.output_dir))
         print(f"\nОбработанные изображения сохранены в: {config.output_dir}")
@@ -361,7 +336,6 @@ def run_streamlit():
     st.set_page_config(page_title="Photo Processor Pro", layout="wide")
     st.title("🖼️ Photo Processor Pro")
 
-    # Настройки
     with st.sidebar:
         st.header("Настройки обработки")
         remove_bg = st.checkbox("Удалить фон", value=True)
@@ -375,7 +349,6 @@ def run_streamlit():
         save_in_custom_folder = st.checkbox("Сохранять в отдельную папку", value=False)
         custom_folder_path = st.text_input("Путь к папке для результатов", value="./results")
 
-    # Загрузка файлов
     uploaded_files = st.file_uploader(
         "Выберите изображения",
         accept_multiple_files=True,
@@ -416,7 +389,6 @@ def run_streamlit():
                     custom_save_folder=Path(custom_folder_path)
                 )
 
-                # Обработка
                 logs = process_batch(config)
                 for log in logs:
                     if "✅" in log:
@@ -426,7 +398,6 @@ def run_streamlit():
                     else:
                         st.info(log)
 
-                # Создать ZIP архива и предложить скачать
                 try:
                     zip_path = create_zip_of_output(str(config.output_dir))
                     with open(zip_path, "rb") as f:
