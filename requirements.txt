@@ -1,4 +1,17 @@
-streamlit>=1.20.0
-opencv-python>=4.5.5.64
-pillow>=9.0.0
+# Основные зависимости для инпейнтинга (LaMa)
+opencv-python>=4.5.0
 numpy>=1.21.0
+torch>=2.0.0
+torchvision>=0.15.0
+timm>=0.6.0
+omegaconf>=2.3.0
+einops>=0.7.0
+pydantic>=2.0.0
+
+# Дополнительные зависимости для LaMa (из репозитория)
+git+https://github.com/saic-mdal/lama.git@main
+
+# Рекомендуемые (для расширенных возможностей)
+Pillow>=9.0.0          # для работы с изображениями
+tqdm>=4.65.0         # для индикации прогресса
+click>=8.0.0         # если захотите сделать CLI красивее
