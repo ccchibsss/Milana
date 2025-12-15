@@ -5,24 +5,63 @@ import io
 import os
 import sys
 from pathlib import Path
+import subprocess
+import platform
 
-# Проверяем наличие OpenCV и устанавливаем если нужно
+# Функция для установки пакетов
+def install_package(package_name):
+    try:
+        # Проверяем, какой пакетный менеджер доступен
+        if hasattr(sys, 'real_prefix') or hasattr(sys, 'base_prefix'):
+            # Мы в виртуальном окружении
+            pip_cmd = [sys.executable, "-m", "pip", "install", package_name]
+        else:
+            pip_cmd = ["pip", "install", package_name]
+            
+        result = subprocess.run(
+            pip_cmd,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        return True, result.stdout
+    except subprocess.CalledProcessError as e:
+        return False, f"Ошибка установки {package_name}: {e.stderr}"
+
+# Проверяем наличие OpenCV
 try:
     import cv2
     OPENCV_AVAILABLE = True
 except ImportError:
     OPENCV_AVAILABLE = False
-    st.warning("OpenCV не установлен. Устанавливаем...")
+    st.warning("OpenCV не установлен. Пытаемся установить...")
     
-    # Попытка установить OpenCV
-    try:
-        import subprocess
-        subprocess.run([sys.executable, "-m", "pip", "install", "opencv-python-headless"], check=True)
-        import cv2
-        OPENCV_AVAILABLE = True
-        st.success("OpenCV успешно установлен!")
-    except Exception as e:
-        st.error(f"Не удалось установить OpenCV: {e}")
+    # Пробуем установить с разными вариантами
+    success, message = install_package("opencv-python-headless")
+    if success:
+        try:
+            import cv2
+            OPENCV_AVAILABLE = True
+            st.success("OpenCV успешно установлен!")
+        except ImportError:
+            OPENCV_AVAILABLE = False
+            st.error("OpenCV установлен, но импорт не работает")
+    else:
+        st.error(f"Не удалось установить OpenCV: {message}")
+        st.info("Попробуем альтернативный вариант...")
+        
+        # Пробуем другой пакет
+        success2, message2 = install_package("opencv-python")
+        if success2:
+            try:
+                import cv2
+                OPENCV_AVAILABLE = True
+                st.success("OpenCV успешно установлен!")
+            except ImportError:
+                OPENCV_AVAILABLE = False
+                st.error("OpenCV установлен, но импорт не работает")
+        else:
+            st.error(f"Не удалось установить OpenCV: {message2}")
 
 # Проверяем наличие torch
 try:
@@ -99,13 +138,19 @@ class WatermarkUtils:
     def inpaint_bgr(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
         """Выполнить inpaint."""
         if not OPENCV_AVAILABLE:
-            # Простая альтернатива без OpenCV - просто размытие области
+            # Простая альтернатива без OpenCV - размытие области
             result = img_bgr.copy()
             mask_bool = mask > 0
+            
+            # Применяем размытие только к области маски
+            from scipy import ndimage
             for c in range(3):
                 channel = result[:, :, c]
-                channel[mask_bool] = np.mean(channel[~mask_bool])
+                # Заменяем пиксели под маской на среднее значение окружающих пикселей
+                blurred = ndimage.gaussian_filter(channel, sigma=3)
+                channel[mask_bool] = blurred[mask_bool]
                 result[:, :, c] = channel
+            
             return result
         
         m = mask.astype(np.uint8)
@@ -130,6 +175,25 @@ class WatermarkUtils:
 def main():
     st.title("🖼️ Watermark Removal Tool")
     st.write("Удаление водяных знаков с изображений")
+    
+    # Информация о системе
+    st.sidebar.header("Информация о системе")
+    st.sidebar.write(f"Python: {sys.version}")
+    st.sidebar.write(f"Платформа: {platform.system()} {platform.release()}")
+    st.sidebar.write(f"OpenCV доступен: {'✅' if OPENCV_AVAILABLE else '❌'}")
+    st.sidebar.write(f"PyTorch доступен: {'✅' if TORCH_AVAILABLE else '❌'}")
+    
+    if not OPENCV_AVAILABLE:
+        st.warning("""
+        ⚠️ OpenCV не установлен. Некоторые функции будут ограничены.
+        
+        Попробуйте установить вручную:
+        ```
+        pip install opencv-python-headless
+        ```
+        
+        Или перезапустите приложение - оно попытается установить автоматически.
+        """)
     
     utils = WatermarkUtils()
     
@@ -193,14 +257,6 @@ def main():
                 file_name="watermark_removed.png",
                 mime="image/png"
             )
-    
-    # Информация о статусе зависимостей
-    st.sidebar.header("Информация")
-    st.sidebar.write(f"OpenCV доступен: {'✅' if OPENCV_AVAILABLE else '❌'}")
-    st.sidebar.write(f"PyTorch доступен: {'✅' if TORCH_AVAILABLE else '❌'}")
-    
-    if not OPENCV_AVAILABLE:
-        st.sidebar.warning("Некоторые функции ограничены без OpenCV")
 
 if __name__ == "__main__":
     main()
