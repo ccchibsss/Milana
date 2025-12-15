@@ -5,13 +5,3 @@ torchvision>=0.15.0
 Pillow>=10.0.0
 numpy>=1.24.0
 lama-cleaner==1.2.5
-scikit-image>=0.21.0
-scipy>=1.11.0
-tqdm>=4.66.0
-omegaconf>=2.3.0
-diffusers==0.16.1  # Совместимая версия с lama-cleaner
-transformers==4.27.4  # Совместимая версия
-accelerate>=0.24.0
-safetensors>=0.3.0
-realesrgan>=0.3.0
-gfpgan>=1.3.0
