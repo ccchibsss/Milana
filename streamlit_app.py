@@ -2,9 +2,11 @@
 """
 watermark_tool.py
 
-Универсальный скрипт для удаления простых водяных знаков.
-Сохранение качества: при возможностях PIL сохраняются метаданные и
-параметры качества (JPEG) / оптимизация (PNG).
+Исправленная и улучшенная версия:
+- устранены синтаксические ошибки;
+- добавлена загрузка/сохранение метаданных (EXIF, ICC) при наличии PIL;
+- при возможности inpaint выполняется в Lab-пространстве (лучше сохраняет светопередачу/тон),
+  а при сохранении JPEG используются высокие настройки качества и отключение сабсемплинга.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import io
 import argparse
 import subprocess
 from pathlib import Path
+from typing import Optional, Dict, Any
 
 # опциональные зависимости
 try:
@@ -49,15 +52,15 @@ def make_sample_image() -> np.ndarray:
         img[300:340, 260:560] = (200, 200, 200)
     return img
 
-def load_image_with_meta(path: str):
+def load_image_with_meta(path: str) -> Optional[Dict[str, Any]]:
     """
-    Загрузить изображение и вернуть словарь:
+    Загрузить изображение и вернуть словарь с данными:
       {
         'img_bgr': numpy.ndarray (H,W,3) или (H,W,4) в BGR(A) порядке,
         'format': PIL format string or None,
         'mode': original PIL mode or None,
         'exif': raw exif bytes or None,
-        'info': pil.info dict (may contain quality, dpi, etc.)
+        'info': pil.info dict (may contain quality, dpi, icc_profile, etc.)
       }
     """
     if path is None:
@@ -73,9 +76,12 @@ def load_image_with_meta(path: str):
         pil_mode = pil.mode
         info = dict(getattr(pil, "info", {}) or {})
         exif = info.get("exif", None)
+        icc = info.get("icc_profile", None)
 
-        # Сохраним альфу если есть; приведём к RGB(A) для удобства
-        if pil_mode not in ("RGB", "RGBA", "L"):
+        # Конвертируем в RGB(A) чтобы не потерять альфу
+        if pil_mode == "P":
+            pil_conv = pil.convert("RGBA") if "A" in pil.getbands() else pil.convert("RGB")
+        elif pil_mode not in ("RGB", "RGBA", "L"):
             try:
                 pil_conv = pil.convert("RGBA")
             except Exception:
@@ -86,9 +92,12 @@ def load_image_with_meta(path: str):
         arr = np.array(pil_conv)
         if arr.ndim == 2:
             arr = np.stack([arr] * 3, axis=-1)
-        # arr в RGB(A) -> BGR(A)
+        # RGB(A) -> BGR(A)
         img_bgr = arr[:, :, ::-1].copy()
-        return {"img_bgr": img_bgr, "format": pil_format, "mode": pil_mode, "exif": exif, "info": info}
+        meta = {"img_bgr": img_bgr, "format": pil_format, "mode": pil_mode, "exif": exif, "info": info}
+        if icc:
+            meta["icc_profile"] = icc
+        return meta
     elif HAS_CV2:
         img = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
         return {"img_bgr": img, "format": None, "mode": None, "exif": None, "info": {}}
@@ -96,33 +105,37 @@ def load_image_with_meta(path: str):
         print("PIL и OpenCV отсутствуют; чтение поддерживается не полностью.")
         return None
 
-def save_image_with_meta(img_bgr: np.ndarray, out_path: str, meta: dict | None = None):
+def save_image_with_meta(img_bgr: np.ndarray, out_path: str, meta: Optional[Dict[str, Any]] = None) -> None:
     """
     Сохранить изображение, пытаясь сохранить формат и метаданные исходного файла.
-    img_bgr: BGR or BGRA uint8
-    meta: результат load_image_with_meta для передачи format/exif/info
+    - img_bgr: BGR or BGRA uint8
+    - meta: результат load_image_with_meta
     """
     p = Path(out_path)
     fmt = None
     exif = None
     info = {}
+    icc_profile = None
     if meta:
         fmt = meta.get("format")
         exif = meta.get("exif")
         info = meta.get("info", {}) or {}
+        icc_profile = meta.get("icc_profile")
 
+    # Определим формат по расширению, если не задан
     if not fmt:
         suf = p.suffix.lower().lstrip(".")
         fmt = {"jpg": "JPEG", "jpeg": "JPEG", "png": "PNG", "webp": "WEBP", "tiff": "TIFF"}.get(suf, None)
 
     if HAS_PIL:
         arr = img_bgr
-        # BGR(A) -> RGB(A)
+        # Перевод из BGR(A) в RGB(A)
         if arr.ndim == 3 and arr.shape[2] == 4:
             pil_img = Image.fromarray(arr[:, :, ::-1], mode="RGBA")
         elif arr.ndim == 3 and arr.shape[2] == 3:
             pil_img = Image.fromarray(arr[:, :, ::-1], mode="RGB")
         else:
+            # fallback grayscale
             if arr.ndim == 3:
                 pil_img = Image.fromarray(arr[:, :, 0], mode="L")
             else:
@@ -131,19 +144,27 @@ def save_image_with_meta(img_bgr: np.ndarray, out_path: str, meta: dict | None =
         save_kwargs = {}
         if exif is not None:
             save_kwargs["exif"] = exif
+        if icc_profile is not None:
+            save_kwargs["icc_profile"] = icc_profile
 
-        if (fmt or "").upper() in ("JPEG", "JPG"):
+        # Настройки по формату для минимизации потерь
+        fmt_upper = (fmt or "").upper()
+        if fmt_upper in ("JPEG", "JPG"):
+            # Попробуем взять качество из info, иначе высокий quality
             q = info.get("quality")
             save_kwargs["quality"] = int(q) if isinstance(q, int) else 95
+            # отключить сжатие хромаканалов (если поддерживается)
             try:
                 save_kwargs.setdefault("subsampling", 0)
-                dpi = info.get("dpi")
-                if dpi:
-                    save_kwargs.setdefault("dpi", dpi)
             except Exception:
                 pass
+            dpi = info.get("dpi")
+            if dpi:
+                save_kwargs.setdefault("dpi", dpi)
             save_kwargs.setdefault("optimize", True)
-        elif (fmt or "").upper() == "PNG":
+            # progressive can be optional
+            save_kwargs.setdefault("progressive", False)
+        elif fmt_upper == "PNG":
             save_kwargs.setdefault("optimize", True)
 
         try:
@@ -152,6 +173,7 @@ def save_image_with_meta(img_bgr: np.ndarray, out_path: str, meta: dict | None =
             else:
                 pil_img.save(str(p), **save_kwargs)
         except TypeError:
+            # Некоторый kwargs могут быть неподдерживаемыми в старых версиях PIL
             try:
                 if fmt:
                     pil_img.save(str(p), format=fmt)
@@ -164,6 +186,7 @@ def save_image_with_meta(img_bgr: np.ndarray, out_path: str, meta: dict | None =
         img_to_write = img_bgr.astype(np.uint8) if img_bgr.dtype != np.uint8 else img_bgr
         cv2.imwrite(str(p), img_to_write)
     else:
+        # PPM fallback (теряем метаданные и альфу)
         h, w = img_bgr.shape[:2]
         with open(p, "wb") as f:
             f.write(f"P6\n{w} {h}\n255\n".encode("ascii"))
@@ -188,13 +211,42 @@ def make_mask_from_gray(gray: np.ndarray, thresh: int = 150, invert: bool = Fals
         return m.astype(np.uint8)
 
 def inpaint_bgr(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Если доступен cv2, выполнить inpaint, иначе вернуть копию."""
-    if HAS_CV2:
-        m = mask.astype(np.uint8)
-        return cv2.inpaint(img_bgr, m, 3, cv2.INPAINT_TELEA)
-    else:
+    """
+    Выполнить inpaint, пытаясь сохранить светопередачу:
+    - при наличии OpenCV: переводим в Lab, инпейнтим в Lab и возвращаем в BGR.
+    - иначе возвращаем копию.
+    """
+    if not HAS_CV2:
         print("OpenCV (cv2) не установлен: inpaint недоступен, возвращаю исходное изображение.")
         return img_bgr.copy()
+
+    # cv2.inpaint ожидает 8-bit 1- or 3-channel image; mask 0/255 uint8
+    m = mask.astype(np.uint8)
+    # Если изображение 4-канальное (BGRA) — инпейнтим только RGB
+    if img_bgr.ndim == 3 and img_bgr.shape[2] == 4:
+        bgr = img_bgr[:, :, :3]
+        alpha = img_bgr[:, :, 3]
+    else:
+        bgr = img_bgr
+        alpha = None
+
+    try:
+        # Переводим в Lab для лучшей работы по светопередаче
+        lab = cv2.cvtColor(bgr, cv2.COLOR_BGR2LAB)
+        lab_inpaint = cv2.inpaint(lab, m, 3, cv2.INPAINT_TELEA)
+        result_bgr = cv2.cvtColor(lab_inpaint, cv2.COLOR_LAB2BGR)
+    except Exception:
+        # В крайнем случае инпейнтим в исходном пространстве по каналам
+        try:
+            result_bgr = cv2.inpaint(bgr, m, 3, cv2.INPAINT_TELEA)
+        except Exception:
+            result_bgr = bgr.copy()
+
+    if alpha is not None:
+        # Восстанавливаем альфу без изменений
+        result = np.dstack([result_bgr, alpha])
+        return result
+    return result_bgr
 
 def overlay_mask_on_bgr(img_bgr: np.ndarray, mask: np.ndarray, color: tuple = (0, 0, 255), alpha: float = 0.3) -> np.ndarray:
     """
@@ -204,18 +256,30 @@ def overlay_mask_on_bgr(img_bgr: np.ndarray, mask: np.ndarray, color: tuple = (0
     alpha - непрозрачность маски (0..1).
     """
     img = img_bgr.copy().astype(np.float32)
-    overlay = np.zeros_like(img, dtype=np.float32)
+    # Если есть альфа-канал — не трогаем его
+    if img.ndim == 3 and img.shape[2] == 4:
+        base = img[:, :, :3]
+        alpha_channel = img[:, :, 3].copy()
+    else:
+        base = img
+        alpha_channel = None
+
+    overlay = np.zeros_like(base, dtype=np.float32)
     if mask.ndim == 2:
-        m3 = np.stack([mask]*3, axis=-1) / 255.0
+        m3 = np.stack([mask] * 3, axis=-1) / 255.0
     else:
         m3 = (mask.astype(np.uint8) != 0).astype(np.float32)
-    overlay[:, :, 0] = color[0]
-    overlay[:, :, 1] = color[1]
-    overlay[:, :, 2] = color[2]
-    alpha_mask = (m3[..., 0] > 0).astype(np.float32) * alpha
+    overlay[:, :, 0] = float(color[0])
+    overlay[:, :, 1] = float(color[1])
+    overlay[:, :, 2] = float(color[2])
+    alpha_mask = (m3[..., 0] > 0).astype(np.float32) * float(alpha)
     alpha_mask = np.expand_dims(alpha_mask, axis=-1)
-    out = img * (1.0 - alpha_mask) + overlay * alpha_mask
-    out = np.clip(out, 0, 255).astype(np.uint8)
+    out_rgb = base * (1.0 - alpha_mask) + overlay * alpha_mask
+    out_rgb = np.clip(out_rgb, 0, 255).astype(np.uint8)
+    if alpha_channel is not None:
+        out = np.dstack([out_rgb, alpha_channel])
+    else:
+        out = out_rgb
     return out
 
 # -------------------- Streamlit-приложение (опционально) --------------------
@@ -237,6 +301,9 @@ def streamlit_app_entry():
     st.title("Image Watermark Remover (streamlit)")
 
     def to_pil(bgr: np.ndarray) -> _Image.Image:
+        # Если BGRA — вернём RGBA; если BGR — RGB
+        if bgr.ndim == 3 and bgr.shape[2] == 4:
+            return _Image.fromarray(bgr[:, :, ::-1], mode="RGBA")
         return _Image.fromarray(bgr[:, :, ::-1])
 
     uploaded = st.file_uploader("Upload image (PNG/JPG). If none uploaded, a sample will be used.",
@@ -277,7 +344,7 @@ def streamlit_app_entry():
             result = overlay_mask_on_bgr(img_bgr, mask_preview, color=(0, 0, 255), alpha=0.35)
         else:
             if st_has_cv2:
-                result = st_cv2.inpaint(img_bgr, mask_preview, 3, st_cv2.INPAINT_TELEA)
+                result = inpaint_bgr(img_bgr, mask_preview)
             else:
                 st.warning("OpenCV не доступен: покажем маску вместо inpaint.")
                 result = overlay_mask_on_bgr(img_bgr, mask_preview, color=(0, 0, 255), alpha=0.35)
@@ -286,7 +353,9 @@ def streamlit_app_entry():
         st.image(to_pil(result), use_column_width=True)
 
         buf = _io.BytesIO()
-        _Image.fromarray(result[:, :, ::-1]).save(buf, format="PNG")
+        # сохраняем результат как PNG в буфер
+        pil_res = to_pil(result)
+        pil_res.save(buf, format="PNG", optimize=True)
         buf.seek(0)
         st.download_button("Download PNG", data=buf, file_name="result.png", mime="image/png")
     else:
@@ -294,7 +363,7 @@ def streamlit_app_entry():
 
 # -------------------- CLI и запуск --------------------
 
-def run_cli_improved(args):
+def run_cli_improved(args) -> int:
     """CLI-режим с сохранением качества/метаданных."""
     if args.input is None:
         print("Входной файл не указан: создаю тестовое изображение.")
@@ -307,22 +376,30 @@ def run_cli_improved(args):
             return 2
         img = meta["img_bgr"]
 
+    # Проверяем наличие альфа-канала
     has_alpha = (img.ndim == 3 and img.shape[2] == 4)
     if has_alpha:
-        bgr = img[:, :, :3].copy()
-        alpha = img[:, :, 3].copy()
+        bgr = img[:, :, :3].copy()  # Отделяем BGR
+        alpha = img[:, :, 3].copy()  # Сохраняем альфа
     else:
         bgr = img
 
-    gray = (cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if HAS_CV2
-            else (np.dot(bgr[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)))
+    # Преобразуем в grayscale для создания маски
+    if HAS_CV2:
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = (np.dot(bgr[..., :3], [0.2989, 0.5870, 0.1140])).astype(np.uint8)
+
+    # Создаём маску водяного знака
     mask = make_mask_from_gray(gray, thresh=args.thresh, invert=args.invert, k=args.kernel)
 
+    # Применяем выбранный метод обработки
     if args.method == "threshold":
         result_bgr = overlay_mask_on_bgr(bgr, mask, color=(0, 0, 255), alpha=0.35)
     else:
         result_bgr = inpaint_bgr(bgr, mask)
 
+    # Если был альфа-канал — восстанавливаем его в результате
     if has_alpha:
         if result_bgr.dtype != np.uint8:
             result_bgr = result_bgr.astype(np.uint8)
@@ -351,18 +428,19 @@ def try_launch_streamlit_here():
     except Exception as e:
         print("Ошибка при запуске streamlit:", e)
 
-def main(argv=None):
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="Watermark remover (CLI or streamlit).")
     parser.add_argument("--serve", action="store_true", help="Попытаться запустить Streamlit UI (если доступен).")
     parser.add_argument("--streamlit-app", action="store_true", help="Внутренний маркер: запустить streamlit-приложение.")
     parser.add_argument("--input", "-i", help="Входной файл (PNG/JPG). Если не указан, используется пример.")
-    parser.add_argument("--output", "-o", help="Выходной файл (PNG/PPM). По умолчанию result.png")
+    parser.add_argument("--output", "-o", help="Выходной файл (PNG/JPG). По умолчанию result.png")
     parser.add_argument("--method", "-m", choices=("inpaint", "threshold"), default="inpaint", help="Метод: inpaint (с cv2) или threshold.")
     parser.add_argument("--thresh", type=int, default=150, help="Порог для маски (0-255).")
     parser.add_argument("--kernel", type=int, default=5, help="Размер ядра морфологии для очистки маски.")
     parser.add_argument("--invert", action="store_true", help="Инвертировать маску.")
     args = parser.parse_args(argv)
 
+    # Если скрипт запущен внутри Streamlit (модуль streamlit уже импортирован) или вызван напрямую
     if "streamlit" in sys.modules or args.streamlit_app:
         try:
             streamlit_app_entry()
@@ -372,13 +450,14 @@ def main(argv=None):
 
     if args.serve:
         try:
-            import streamlit
+            import streamlit  # проверка доступности
             try_launch_streamlit_here()
         except Exception:
             print("Streamlit не установлен или недоступен в текущем окружении.")
             print("Установите streamlit: pip install streamlit")
         return 0
 
+    # CLI
     return run_cli_improved(args)
 
 if __name__ == "__main__":
