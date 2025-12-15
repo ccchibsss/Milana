@@ -1,6 +1,5 @@
-streamlit>=1.38.0
-rembg==2.0.69  # или удалите эту строку
-rich>=10.14.0
-opencv-python-headless
-Pillow
-numpy
+libraries used : tkinter
+		 from tkinter import filedialog
+		 import tkinter.messagebox
+		 from PIL import ImageTk, Image
+		 cv2
