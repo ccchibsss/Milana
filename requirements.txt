@@ -1,5 +1,4 @@
-libraries used : tkinter
-		 from tkinter import filedialog
-		 import tkinter.messagebox
-		 from PIL import ImageTk, Image
-		 cv2
+streamlit>=1.20.0
+opencv-python>=4.5.5.64
+pillow>=9.0.0
+numpy>=1.21.0
