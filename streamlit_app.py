@@ -6,7 +6,8 @@ PyWebview frontend with brainrot HTML UI
 """
 
 import logging
-# Suppress noisy pywebview WebView2 COM warnings (thread safety noise, doesn't affect functionality)
+# Suppress noisy pywebview WebView2 COM warnings (thread safety noise, doesn't
+# affect functionality)
 class PyWebviewFilter(logging.Filter):
     def filter(self, record):
         msg = record.getMessage()
@@ -26,6 +27,7 @@ import json
 import yaml
 import base64
 from pathlib import Path
+import time
 
 # Only psutil for system info (lightweight)
 try:
@@ -76,6 +78,53 @@ class Api:
     def save_config(self, config):
         self.config = config
         self._save_config(config)
+
+    # Простые реализации недостающих проверок (чтобы модуль был самодостаточным)
+    def _would_overwrite_input(self, input_path, output_path):
+        try:
+            inp = os.path.abspath(input_path)
+            out = os.path.abspath(output_path)
+            # если точно одинаковые пути - перезапись
+            if inp == out:
+                return True
+            # если input файл и output - директория, и запись пойдёт в тот же файл
+            if os.path.isfile(inp) and os.path.isdir(out):
+                if os.path.abspath(os.path.join(out, os.path.basename(inp))) == inp:
+                    return True
+            # если output указывает на файл и совпадает с input
+            if os.path.isfile(out) and inp == out:
+                return True
+        except Exception:
+            return False
+        return False
+
+    def _check_file_conflicts(self, input_path, output_path):
+        """
+        Простая проверка конфликтов: если input - файл, проверяем наличие файла с тем же именем в output dir.
+        Если input - папка, для каждого файла проверяем наличие с тем же именем в output dir.
+        Возвращаем список имён файлов, которые уже существуют в выходной папке и могли бы быть перезаписаны.
+        """
+        conflicts = []
+        try:
+            if os.path.isfile(input_path):
+                out_dir = output_path if os.path.isdir(output_path) else os.path.dirname(output_path)
+                target = os.path.join(out_dir, os.path.basename(input_path))
+                if os.path.exists(target) and os.path.abspath(target) != os.path.abspath(input_path):
+                    conflicts.append(os.path.basename(target))
+            elif os.path.isdir(input_path):
+                out_dir = output_path if os.path.isdir(output_path) else output_path
+                if not os.path.isdir(out_dir):
+                    return conflicts
+                for root, _, files in os.walk(input_path):
+                    for fn in files:
+                        target = os.path.join(out_dir, fn)
+                        if os.path.exists(target):
+                            conflicts.append(fn)
+                    # не углубляемся: рассматриваем только корень входной папки
+                    break
+        except Exception:
+            pass
+        return conflicts
 
     # Основной метод для запуска обработки
     def start_processing(self, settings):
@@ -283,18 +332,38 @@ def start_webview():
     webview.start()
 
 # ===========================
-# Запуск Streamlit
+# Запуск Streamlit (с загрузкой и скачиванием)
 # ===========================
 
 def start_streamlit():
-    # Объявляем глобальный api
     global api
     api = Api()
 
-    # Создаем интерфейс
-    st.title("WatermarkRemover AI - Настройки")
-    input_path = st.text_input("Путь к файлу или папке для обработки")
-    output_path = st.text_input("Путь для сохранения результата")
+    st.title("WatermarkRemover AI - Настройки (Streamlit с загрузкой/скачиванием)")
+
+    # File uploader
+    uploaded = st.file_uploader(
+        "Загрузить файл для обработки",
+        type=['png', 'jpg', 'jpeg', 'webp', 'bmp', 'gif']
+    )
+    saved_path = ""
+    if uploaded is not None:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        upload_dir = os.path.join(script_dir, "uploads")
+        os.makedirs(upload_dir, exist_ok=True)
+        # Сохраняем загруженный файл в папку uploads
+        saved_path = os.path.join(upload_dir, uploaded.name)
+        try:
+            with open(saved_path, "wb") as f:
+                f.write(uploaded.getbuffer())
+            st.success(f"Файл сохранён: {saved_path}")
+        except Exception as e:
+            st.error(f"Не удалось сохранить файл: {e}")
+            saved_path = ""
+
+    # Поля для ручного ввода (или заполнятся автоматически если был upload)
+    input_path = st.text_input("Путь к файлу или папке для обработки", value=saved_path)
+    output_path = st.text_input("Путь для сохранения результата (оставьте пустым — использовать входную папку)")
     overwrite = st.checkbox("Перезаписать файлы", value=False)
     transparent = st.checkbox("Прозрачность", value=False)
     max_bbox = st.slider("Максимальный процент области", 0, 100, 15)
@@ -305,7 +374,9 @@ def start_streamlit():
     fade_out = st.slider("Плавное исчезновение", 0, 10, 0)
 
     if st.button("Запустить обработку"):
-        def run():
+        if not input_path:
+            st.error("Укажите путь к файлу или загрузите файл.")
+        else:
             settings = {
                 'input': input_path,
                 'output': output_path,
@@ -318,12 +389,45 @@ def start_streamlit():
                 'fade_in': fade_in,
                 'fade_out': fade_out
             }
-            result = api.start_processing(settings)
-            if 'error' in result:
-                st.error(result['error'])
-            else:
-                st.success("Обработка запущена.")
-        threading.Thread(target=run).start()
+
+            def run_and_wait():
+                res = api.start_processing(settings)
+                if 'error' in res:
+                    st.error(res['error'])
+                    return
+                # Ждём пока процесс завершится (api._run_process в отдельном потоке)
+                with st.spinner("Обработка... (ожидание завершения процесса)"):
+                    while api.is_running:
+                        time.sleep(0.5)
+                st.success("Обработка завершена.")
+
+                # Определяем папку с результатами
+                inp = settings.get('input')
+                out_dir = settings.get('output') or (os.path.dirname(inp) if os.path.isfile(inp) else inp)
+                files_to_offer = []
+                if os.path.isdir(out_dir):
+                    for fn in sorted(os.listdir(out_dir)):
+                        full = os.path.join(out_dir, fn)
+                        if os.path.isfile(full):
+                            files_to_offer.append(full)
+                elif os.path.isfile(out_dir):
+                    files_to_offer.append(out_dir)
+
+                if not files_to_offer:
+                    st.info("Нет файлов для скачивания в указанной папке.")
+                else:
+                    st.markdown("### Скачать результаты")
+                    for fp in files_to_offer:
+                        name = os.path.basename(fp)
+                        try:
+                            with open(fp, "rb") as fh:
+                                data = fh.read()
+                            st.download_button(label=f"Скачать {name}", data=data, file_name=name)
+                        except Exception as e:
+                            st.write(f"Не удалось подготовить {name}: {e}")
+
+            # Запускаем в отдельном потоке, чтобы интерфейс не блокировался (Streamlit всё равно обновит вид)
+            threading.Thread(target=run_and_wait, daemon=True).start()
 
 # ===========================
 # Основной запуск
