@@ -1,8 +1,7 @@
 # !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — полный скрипт с интеграцией модели сегментации водяных знаков
-(CLI + Streamlit)
+Photo Processor Pro — исправленный скрипт с моделью сегментации водяных знаков для Streamlit
 """
 
 from __future__ import annotations
@@ -11,58 +10,47 @@ import io
 import json
 import logging
 import sys
-import zipfile
+from pathlib import Path
 import tempfile
 import shutil
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from pathlib import Path
-from typing import List, Optional, Tuple
-import concurrent.futures
 
 import cv2
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
-# Загрузка модели ONNX сегментации водяных знаков
-import onnxruntime as ort
-
-MODEL_PATH = "watermark_segmentation.onnx"  # Укажите путь к вашей модели
-model_session = None
+# Опциональные библиотеки
 try:
-    model_session = ort.InferenceSession(MODEL_PATH)
-    print("Модель сегментации водяных знаков загружена")
-except Exception:
-    print("Не удалось загрузить модель сегментации водяных знаков")
-
-# Optional deps
-try:
-    from rembg import remove as rembg_remove  # type: ignore
+    from rembg import remove as rembg_remove
     HAS_REMBG = True
-except Exception:
+except ImportError:
     rembg_remove = None
     HAS_REMBG = False
 
 try:
     import streamlit as st
     HAS_STREAMLIT = True
-except Exception:
+except ImportError:
     st = None
     HAS_STREAMLIT = False
 
+import onnxruntime as ort  # Для сегментации водяных знаков
+
+# Путь к модели ONNX
+MODEL_PATH = "watermark_segmentation.onnx"  # Укажите правильный путь к вашей модели
+try:
+    model_session = ort.InferenceSession(MODEL_PATH)
+    print("Модель сегментации водяных знаков загружена")
+except Exception:
+    model_session = None
+    print("Не удалось загрузить модель сегментации водяных знаков. Проверьте наличие файла и установку onnxruntime.")
+
 # Логгер
-def setup_logger() -> logging.Logger:
-    fn = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(fn, encoding="utf-8"), logging.StreamHandler()],
-    )
-    return logging.getLogger("photo_processor")
+logger = logging.getLogger("photo_processor")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-logger = setup_logger()
 
-# Конфигурации и вспомогательные функции
 @dataclass
 class WatermarkParams:
     threshold: int = 220
@@ -101,34 +89,8 @@ class ProcessingConfig:
     inp: Path = Path("./input")
     outp: Path = Path("./output")
 
-# Создаем директории
-def ensure_dir(p: Path):
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        logger.exception("ensure_dir failed for %s", p)
 
-def save_params(params: WatermarkParams, filename: str):
-    try:
-        with open(filename, "w", encoding="utf-8") as f:
-            json.dump(asdict(params), f, ensure_ascii=False, indent=2)
-        logger.info("Saved params to %s", filename)
-    except Exception:
-        logger.exception("save_params failed")
-
-def load_params(filename: str) -> WatermarkParams:
-    p = Path(filename)
-    if not p.exists():
-        return WatermarkParams()
-    try:
-        with p.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        merged = {**WatermarkParams().__dict__, **(data or {})}
-        return WatermarkParams(**merged).normalized()
-    except Exception:
-        logger.exception("load_params failed, using defaults")
-        return WatermarkParams()
-
+# Функция для загрузки конфигурации
 def load_config(filename: str = "ppp_config.json") -> ProcessingConfig:
     p = Path(filename)
     if not p.exists():
@@ -151,10 +113,28 @@ def load_config(filename: str = "ppp_config.json") -> ProcessingConfig:
         )
         return cfg
     except Exception:
-        logger.exception("load_config failed, returning defaults")
+        logger.exception("Ошибка при загрузке конфигурации")
         return ProcessingConfig()
 
-# Удаление фона
+
+# Создаем директории
+def ensure_dir(p: Path):
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        logger.exception("Ошибка при создании директории %s", p)
+
+
+def save_params(params: WatermarkParams, filename: str):
+    try:
+        with open(filename, "w", encoding="utf-8") as f:
+            json.dump(asdict(params), f, ensure_ascii=False, indent=2)
+        logger.info("Параметры сохранены в %s", filename)
+    except Exception:
+        logger.exception("Ошибка при сохранении параметров")
+
+
+# Обработка удаления фона
 def remove_background(pil_img: Image.Image, cfg: ProcessingConfig) -> Image.Image:
     if not cfg.remove_bg or not HAS_REMBG or rembg_remove is None:
         return pil_img
@@ -165,10 +145,11 @@ def remove_background(pil_img: Image.Image, cfg: ProcessingConfig) -> Image.Imag
         out = rembg_remove(buf.read())
         return Image.open(io.BytesIO(out)).convert("RGBA")
     except Exception:
-        logger.exception("remove_background failed")
+        logger.exception("Ошибка при удалении фона")
         return pil_img
 
-# Анализ изображения
+
+# Анализ изображения для автоматической настройки
 def analyze_image_for_params(pil_img: Image.Image) -> WatermarkParams:
     try:
         rgb = np.array(pil_img.convert("RGB"))
@@ -179,10 +160,11 @@ def analyze_image_for_params(pil_img: Image.Image) -> WatermarkParams:
         adaptive = contrast_std > 15
         return WatermarkParams(threshold=int(threshold), adaptive=bool(adaptive), block_size=31, c=10).normalized()
     except Exception:
-        logger.exception("analyze_image_for_params failed")
+        logger.exception("Ошибка при анализе изображения")
         return WatermarkParams()
 
-# Вызов сегментации водяных знаков с моделью ONNX
+
+# Модель сегментации водяных знаков
 def segment_watermark_with_model(pil_img: Image.Image) -> np.ndarray:
     if model_session is None:
         return np.zeros((pil_img.height, pil_img.width), dtype=np.uint8)
@@ -199,7 +181,8 @@ def segment_watermark_with_model(pil_img: Image.Image) -> np.ndarray:
         print("Ошибка при запуске модели сегментации")
         return np.zeros((pil_img.height, pil_img.width), dtype=np.uint8)
 
-# Обнаружение водяного знака
+
+# Детекция водяного знака автоматически
 def detect_watermark_auto(pil_img: Image.Image, params: WatermarkParams) -> np.ndarray:
     params = params.normalized()
     rgb = np.array(pil_img.convert("RGB"))
@@ -233,17 +216,18 @@ def detect_watermark_auto(pil_img: Image.Image, params: WatermarkParams) -> np.n
         cv2.drawContours(mask, [c], -1, 255, -1)
     return mask
 
-# В удалении водяных знаков с помощью модели ONNX
+
+# Удаление водяных знаков
 def remove_watermark(img_cv: np.ndarray, cfg: ProcessingConfig, use_model_segmentation=False) -> np.ndarray:
     if not cfg.remove_wm:
         return img_cv
     try:
-        # Используем модель сегментации, если указано
+        # Используем модель, если указано
         if use_model_segmentation:
             pil_img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
             mask = segment_watermark_with_model(pil_img)
         else:
-            # Можно оставить старую логику или оставить пустую маску
+            # Или fallback
             mask = np.zeros((img_cv.shape[0], img_cv.shape[1]), dtype=np.uint8)
 
         has_alpha = img_cv.ndim == 3 and img_cv.shape[2] == 4
@@ -301,7 +285,8 @@ def remove_watermark(img_cv: np.ndarray, cfg: ProcessingConfig, use_model_segmen
         logger.exception("Ошибка при удалении водяного знака")
         return img_cv
 
-# Resize и сохранение
+
+# Resize изображений
 def resize_cv(img_cv: np.ndarray, w_target: Optional[int], h_target: Optional[int]) -> np.ndarray:
     h, w = img_cv.shape[:2]
     if not w_target and not h_target:
@@ -316,6 +301,8 @@ def resize_cv(img_cv: np.ndarray, w_target: Optional[int], h_target: Optional[in
         return cv2.resize(img_cv, (max(1, int(w*scale)), h_target), interpolation=cv2.INTER_AREA)
     return img_cv
 
+
+# Сохранение изображения
 def save_cv_image(img_cv: np.ndarray, out_path: Path, cfg: ProcessingConfig) -> bool:
     try:
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -334,11 +321,12 @@ def save_cv_image(img_cv: np.ndarray, out_path: Path, cfg: ProcessingConfig) -> 
             pil.save(out_path, fmt)
         return True
     except Exception:
-        logger.exception("save_cv_image failed for %s", out_path)
+        logger.exception("Ошибка при сохранении %s", out_path)
         return False
 
-# Обработка одного изображения
-def process_image(in_path: Path, out_path: Path, cfg: ProcessingConfig, use_model_segmentation=False) -> Tuple[bool, str]:
+
+# Обработка одного файла
+def process_image(in_path: Path, out_dir: Path, cfg: ProcessingConfig, use_model_segmentation=False) -> tuple:
     try:
         pil = Image.open(in_path)
         pil = pil.convert("RGBA") if pil.mode in ("RGBA", "LA") else pil.convert("RGB")
@@ -350,66 +338,72 @@ def process_image(in_path: Path, out_path: Path, cfg: ProcessingConfig, use_mode
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
         elif img_cv.shape[2] == 4:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGBA2BGRA)
-        # Вызов удаления водяных знаков с моделью
+        # Удаление водяных знаков
         img_cv = remove_watermark(img_cv, cfg, use_model_segmentation=use_model_segmentation)
-        out_final = out_path.with_suffix("." + cfg.fmt.lower())
-        if save_cv_image(img_cv, out_final, cfg):
-            return True, ""
-        return False, f"Error saving {out_final}"
+        out_path = out_dir / f"{in_path.stem}.{cfg.fmt.lower()}"
+        success = save_cv_image(img_cv, out_path, cfg)
+        return success, ""
     except UnidentifiedImageError:
-        return False, f"Unidentified image: {in_path.name}"
+        return False, f"Неизвестный формат изображения: {in_path.name}"
     except Exception:
-        logger.exception("process_image failed for %s", in_path)
-        return False, "processing error"
+        logger.exception("Ошибка при обработке %s", in_path)
+        return False, "Ошибка обработки"
+
 
 # Обработка батча
 def process_batch(input_dir: Path, output_dir: Path, cfg: ProcessingConfig, max_workers: int = 4):
     ensure_dir(input_dir)
     ensure_dir(output_dir)
     files = [p for p in sorted(input_dir.iterdir()) if p.is_file() and p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}]
-    results: List[Tuple[Path, bool, str]] = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futures = {ex.submit(process_image, p, output_dir / p.stem, cfg, True): p for p in files}
-        for f in concurrent.futures.as_completed(futures):
-            p = futures[f]
+    results = []
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(process_image, p, output_dir, cfg, True): p for p in files}
+        for future in concurrent.futures.as_completed(futures):
+            p = futures[future]
             try:
-                ok, msg = f.result()
-                results.append((p, ok, msg))
-            except Exception as e:
-                results.append((p, False, str(e)))
+                success, msg = future.result()
+                results.append((p, success, msg))
+            except Exception:
+                logger.exception("Обработка завершилась с ошибкой для %s", p)
+                results.append((p, False, "Обработка завершилась с ошибкой"))
     return results
 
-# ZIP-архив результатов
-def zip_results(out_dir: Path, results: List[Tuple[Path, bool, str]], format_ext: str) -> bytes:
+
+# Создание ZIP архива
+def zip_results(output_dir: Path, results: list, format_ext: str) -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for p, ok, _ in results:
             if not ok:
                 continue
-            fname = f"{p.stem}.{format_ext}"
-            fp = out_dir / fname
+            filename = f"{p.stem}.{format_ext}"
+            fp = output_dir / filename
             if fp.exists():
-                zf.write(fp, arcname=fname)
+                zf.write(fp, arcname=filename)
     buf.seek(0)
     return buf.read()
 
-# CLI функция
+
+# CLI интерфейс
 def run_cli(argv=None):
+    import argparse
     parser = argparse.ArgumentParser(description="Photo Processor Pro CLI")
-    parser.add_argument("--input", type=Path, default=Path("./input"), help="Input folder (default ./input)")
-    parser.add_argument("--output", type=Path, default=Path("./output"), help="Output folder (default ./output)")
-    parser.add_argument("--calibrate", action="store_true", help="Calibrate (analyze + save params)")
-    parser.add_argument("--params_file", type=str, default="detected_params.json", help="Params файл")
-    parser.add_argument("--remove_bg", action="store_true", help="Удалить фон")
-    parser.add_argument("--remove_wm", action="store_true", help="Удалить водяные знаки")
-    parser.add_argument("--workers", type=int, default=4, help="Количество потоков")
+    parser.add_argument("--input", type=Path, default=Path("./input"))
+    parser.add_argument("--output", type=Path, default=Path("./output"))
+    parser.add_argument("--calibrate", action="store_true")
+    parser.add_argument("--params_file", type=str, default="detected_params.json")
+    parser.add_argument("--remove_bg", action="store_true")
+    parser.add_argument("--remove_wm", action="store_true")
+    parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args(argv)
 
-    cfg = ProcessingConfig(inp=args.input, outp=args.output)
-    if args.remove_bg:
-        cfg.remove_bg = True
-    if args.remove_wm:
-        cfg.remove_wm = True
+    cfg = ProcessingConfig(
+        inp=args.input,
+        outp=args.output,
+        remove_bg=args.remove_bg,
+        remove_wm=args.remove_wm,
+    )
 
     if args.calibrate:
         ensure_dir(cfg.inp)
@@ -419,7 +413,7 @@ def run_cli(argv=None):
                 pil = Image.open(sample)
                 params = analyze_image_for_params(pil)
                 save_params(params, args.params_file)
-                print(f"Сохранено параметров в {args.params_file}")
+                print(f"Параметры сохранены в {args.params_file}")
             except Exception:
                 logger.exception("Калибровка не удалась")
                 print("Калибровка не удалась")
@@ -437,6 +431,7 @@ def run_streamlit():
     if st is None:
         raise RuntimeError("Streamlit не установлен")
     cfg = load_config()
+
     st.title("Photo Processor Pro — обработка изображений")
     st.sidebar.header("Настройки")
     inp_dir = Path(st.sidebar.text_input("Входная папка", str(cfg.inp)))
@@ -505,22 +500,24 @@ def run_streamlit():
                 if img_path.exists():
                     try:
                         img = Image.open(img_path)
-                        cols[i % 3].image(img, caption=p.name, use_column_width=True)
+                        cols[i % 3].image(img, caption=p.name, width=200)
                     except Exception:
-                        logger.exception("Failed to отображение %s", img_path)
+                        logger.exception("Не удалось отобразить %s", img_path)
 
     if temp_dir and temp_dir.exists():
         try:
             shutil.rmtree(temp_dir)
         except Exception:
-            logger.exception("Failed to cleanup temp_dir")
+            logger.exception("Не удалось удалить временную папку")
 
-# Основная точка входа
+
+# Основной запуск
 def main():
     if HAS_STREAMLIT and len(sys.argv) <= 1:
         run_streamlit()
     else:
         run_cli()
+
 
 if __name__ == "__main__":
     main()
