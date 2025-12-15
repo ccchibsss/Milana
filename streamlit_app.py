@@ -276,7 +276,11 @@ def refine_mask(mask: np.ndarray, min_size: int = 100) -> np.ndarray:
     return refined
 
 # Основная функция удаления водяных знаков
-def remove_watermark(img_cv: np.ndarray, cfg: ProcessingConfig, use_model: bool = True) -> np.ndarray:
+def remove_watermark(
+    img_cv: np.ndarray, 
+    cfg: ProcessingConfig, 
+    use_model: bool = True
+) -> np.ndarray:
     if not cfg.remove_wm:
         return img_cv
     try:
@@ -382,7 +386,7 @@ def process_image(in_path: Path, out_path: Path, cfg: ProcessingConfig, use_mode
         elif img_cv.shape[2] == 4:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGBA2BGRA)
         # Удаление водяных знаков
-        img_cv = remove_watermark(img_cv, cfg, use_model_segmentation=use_model_segmentation)
+        img_cv = remove_watermark(img_cv, cfg, use_model=use_model_segmentation)
         out_final = out_path.with_suffix("." + cfg.fmt.lower())
         if save_cv_image(img_cv, out_final, cfg):
             return True, ""
@@ -423,7 +427,10 @@ def zip_results(out_dir: Path, results: List[Tuple[Path, bool, str]], format_ext
             fname = f"{p.stem}.{format_ext}"
             fp = out_dir / fname
             if fp.exists():
-                zf.write(fp, arcname=fname)
+                try:
+                    zf.write(fp, arcname=fname)
+                except:
+                    logger.exception("Ошибка при добавлении файла в ZIP: %s", fp)
     buf.seek(0)
     return buf.read()
 
