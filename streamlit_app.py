@@ -198,7 +198,7 @@ def streamlit_app_entry():
 
     if apply:
         if method.startswith("Binary"):
-            # keep original colors, add semi-transparent red overlay on mask
+            # сохраняем оригинальные цвета и накладываем полупрозрачную подсветку маски
             result = overlay_mask_on_bgr(img_bgr, mask_preview, color=(0, 0, 255), alpha=0.35)
         else:
             if st_has_cv2:
@@ -236,7 +236,7 @@ def run_cli(args):
     mask = make_mask_from_gray(gray, thresh=args.thresh, invert=args.invert, k=args.kernel)
 
     if args.method == "threshold":
-        # сохранить оригинальные цвета и подсветить найденную маску (полупрозрачная красная подсветка)
+        # сохранить оригинальные цвета и подсветить маску
         result = overlay_mask_on_bgr(img, mask, color=(0, 0, 255), alpha=0.35)
     else:
         result = inpaint_bgr(img, mask)
