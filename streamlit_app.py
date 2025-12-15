@@ -2,12 +2,13 @@
 """
 watermark_tool.py
 
-Исправленный и рабочий вариант:
-- Работает в CLI режиме по умолчанию.
-- При наличии streamlit можно запускать UI: python watermark_tool.py --serve
-  (скрипт попытается запустить `python -m streamlit run <thisfile> -- --streamlit-app`)
-- Если streamlit импортирован (например, когда streamlit запускает файл), скрипт
-  вызовет streamlit_app_entry() и отрисует интерфейс внутри Streamlit.
+Универсальный скрипт для удаления простых водяных знаков.
+Работает как CLI; при наличии streamlit можно запустить UI: python watermark_tool.py --serve
+Если streamlit запускает файл (streamlit run ...), внутри будет вызван streamlit_app_entry().
+
+Изменение: в режиме "Binary Threshold (preview only)" теперь результат
+сохраняет оригинальные цвета и добавляет полупрозрачную цветовую подсветку
+обнаруженной маски, вместо вывода чисто серой маски.
 """
 
 from __future__ import annotations
@@ -49,7 +50,6 @@ def make_sample_image() -> np.ndarray:
         cv2.putText(img, "SAMPLE IMAGE", (40, 180), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (80, 80, 200), 4, cv2.LINE_AA)
         cv2.putText(img, "WATERMARK", (300, 320), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2, cv2.LINE_AA)
     else:
-        # простая имитация "водяного знака" прямоугольником
         img[300:340, 260:560] = (200, 200, 200)
     return img
 
@@ -83,7 +83,6 @@ def save_image_bgr(img_bgr: np.ndarray, out_path: str) -> None:
         cv2.imwrite(str(p), img_bgr)
         return
     else:
-        # Сохранение в PPM (P6)
         h, w = img_bgr.shape[:2]
         with open(p, "wb") as f:
             f.write(f"P6\n{w} {h}\n255\n".encode("ascii"))
@@ -92,7 +91,7 @@ def save_image_bgr(img_bgr: np.ndarray, out_path: str) -> None:
         return
 
 def make_mask_from_gray(gray: np.ndarray, thresh: int = 150, invert: bool = False, k: int = 5) -> np.ndarray:
-    """Создать бинарную маску из серого изображения."""
+    """Создать бинарную маску из серого изображения (uint8 0/255)."""
     if HAS_CV2:
         _, m = cv2.threshold(gray, int(thresh), 255, cv2.THRESH_BINARY)
         if invert:
@@ -101,20 +100,47 @@ def make_mask_from_gray(gray: np.ndarray, thresh: int = 150, invert: bool = Fals
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
             m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
             m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
-        return m
+        return m.astype(np.uint8)
     else:
         m = (gray > thresh).astype(np.uint8) * 255
         if invert:
             m = 255 - m
-        return m
+        return m.astype(np.uint8)
 
 def inpaint_bgr(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """Если доступен cv2, выполнить inpaint, иначе вернуть копию."""
     if HAS_CV2:
-        return cv2.inpaint(img_bgr, mask, 3, cv2.INPAINT_TELEA)
+        # cv2.inpaint ожидает uint8 mask (0 или 255)
+        m = mask.astype(np.uint8)
+        return cv2.inpaint(img_bgr, m, 3, cv2.INPAINT_TELEA)
     else:
         print("OpenCV (cv2) не установлен: inpaint недоступен, возвращаю исходное изображение.")
         return img_bgr.copy()
+
+def overlay_mask_on_bgr(img_bgr: np.ndarray, mask: np.ndarray, color: tuple = (0, 0, 255), alpha: float = 0.3) -> np.ndarray:
+    """
+    Наложить цветную полупрозрачную маску на BGR-изображение.
+    color - (B,G,R) значение 0-255 для подсветки.
+    mask - uint8 0/255, single channel.
+    alpha - непрозрачность маски (0..1).
+    Возвращает BGR uint8.
+    """
+    img = img_bgr.copy().astype(np.float32)
+    overlay = np.zeros_like(img, dtype=np.float32)
+    # Broadcast mask to 3 channels and set color
+    if mask.ndim == 2:
+        m3 = np.stack([mask]*3, axis=-1) / 255.0  # 0..1
+    else:
+        m3 = (mask.astype(np.uint8) != 0).astype(np.float32)
+    overlay[:, :, 0] = color[0]
+    overlay[:, :, 1] = color[1]
+    overlay[:, :, 2] = color[2]
+    # Blend only where mask is present
+    alpha_mask = (m3[..., 0] > 0).astype(np.float32) * alpha
+    alpha_mask = np.expand_dims(alpha_mask, axis=-1)
+    out = img * (1.0 - alpha_mask) + overlay * alpha_mask
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    return out
 
 # -------------------- Streamlit-приложение (опционально) --------------------
 
@@ -143,7 +169,7 @@ def streamlit_app_entry():
         data = uploaded.read()
         try:
             pil = _Image.open(_io.BytesIO(data)).convert("RGB")
-            img_bgr = _np.array(pil)[:, :, ::-1]
+            img_bgr = np.array(pil)[:, :, ::-1]
         except Exception:
             st.error("Не удалось прочитать загруженный файл.")
             st.stop()
@@ -163,7 +189,7 @@ def streamlit_app_entry():
         st.image(to_pil(img_bgr), use_column_width=True)
 
     gray = (st_cv2.cvtColor(img_bgr, st_cv2.COLOR_BGR2GRAY) if st_has_cv2
-            else (_np.dot(img_bgr[..., :3], [0.2989, 0.5870, 0.1140]).astype(_np.uint8)))
+            else (np.dot(img_bgr[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)))
     mask_preview = make_mask_from_gray(gray, thresh, invert_mask, kernel_size)
 
     with col2:
@@ -172,16 +198,14 @@ def streamlit_app_entry():
 
     if apply:
         if method.startswith("Binary"):
-            if st_has_cv2:
-                result = st_cv2.cvtColor(mask_preview, st_cv2.COLOR_GRAY2BGR)
-            else:
-                result = _np.stack([mask_preview] * 3, axis=-1)
+            # keep original colors, add semi-transparent red overlay on mask
+            result = overlay_mask_on_bgr(img_bgr, mask_preview, color=(0, 0, 255), alpha=0.35)
         else:
             if st_has_cv2:
                 result = st_cv2.inpaint(img_bgr, mask_preview, 3, st_cv2.INPAINT_TELEA)
             else:
                 st.warning("OpenCV не доступен: покажем маску вместо inpaint.")
-                result = _np.stack([mask_preview] * 3, axis=-1)
+                result = overlay_mask_on_bgr(img_bgr, mask_preview, color=(0, 0, 255), alpha=0.35)
 
         st.subheader("Result")
         st.image(to_pil(result), use_column_width=True)
@@ -212,7 +236,8 @@ def run_cli(args):
     mask = make_mask_from_gray(gray, thresh=args.thresh, invert=args.invert, k=args.kernel)
 
     if args.method == "threshold":
-        result = (cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if HAS_CV2 else np.stack([mask] * 3, axis=-1))
+        # сохранить оригинальные цвета и подсветить найденную маску (полупрозрачная красная подсветка)
+        result = overlay_mask_on_bgr(img, mask, color=(0, 0, 255), alpha=0.35)
     else:
         result = inpaint_bgr(img, mask)
 
@@ -231,7 +256,6 @@ def try_launch_streamlit_here():
     print("Запуск Streamlit командой:")
     print(" ".join(cmd))
     try:
-        # Popen чтобы не блокировать текущий процесс
         subprocess.Popen(cmd)
     except FileNotFoundError:
         print("streamlit не найден в окружении. Установите пакет: pip install streamlit")
