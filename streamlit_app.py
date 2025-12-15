@@ -1,7 +1,13 @@
-#!/usr/bin/env python3
+# !/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Photo Processor Pro — полный скрипт (CLI + Streamlit) с расширенной автоматической обработкой водяных знаков
+Photo Processor Pro — улучшенная и надёжная версия (CLI + Streamlit).
+Исправления и улучшения:
+- безопасный импорт onnxruntime и rembg;
+- аккуратная обработка ошибок (без bare except);
+- небольшие улучшения детекции и работы с PIL/NumPy;
+- явное управление временными директориями в Streamlit;
+- понятное логирование.
 """
 
 from __future__ import annotations
@@ -23,25 +29,12 @@ import cv2
 import numpy as np
 from PIL import Image, UnidentifiedImageError
 
-# Импорт onnxruntime
+# optional deps
 try:
     import onnxruntime as ort  # type: ignore
 except Exception:
     ort = None
 
-MODEL_PATH = Path("watermark_segmentation.onnx")
-model_session = None
-if ort is not None and MODEL_PATH.exists():
-    try:
-        model_session = ort.InferenceSession(str(MODEL_PATH))
-        print("ONNX модель загружена:", MODEL_PATH)
-    except Exception:
-        model_session = None
-        print("Не удалось загрузить ONNX модель, продолжаем без нее")
-else:
-    model_session = None
-
-# rembg
 try:
     from rembg import remove as rembg_remove  # type: ignore
     HAS_REMBG = True
@@ -49,7 +42,6 @@ except Exception:
     rembg_remove = None
     HAS_REMBG = False
 
-# streamlit
 try:
     import streamlit as st  # type: ignore
     HAS_STREAMLIT = True
@@ -57,19 +49,35 @@ except Exception:
     st = None
     HAS_STREAMLIT = False
 
-# Логгер
+# model session (optional)
+MODEL_PATH = Path("watermark_segmentation.onnx")
+model_session = None
+if ort is not None and MODEL_PATH.exists():
+    try:
+        model_session = ort.InferenceSession(str(MODEL_PATH))
+        logging.getLogger().info("ONNX model loaded: %s", MODEL_PATH)
+    except Exception:
+        model_session = None
+        logging.getLogger().exception("Failed to load ONNX model; continuing without it")
+
+# logger
 def setup_logger() -> logging.Logger:
-    fn = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        handlers=[logging.FileHandler(fn, encoding="utf-8"), logging.StreamHandler()],
-    )
-    return logging.getLogger("photo_processor")
+    log = logging.getLogger("photo_processor")
+    if not log.handlers:
+        fn = f"log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        handler = logging.FileHandler(fn, encoding="utf-8")
+        sh = logging.StreamHandler()
+        fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        handler.setFormatter(fmt)
+        sh.setFormatter(fmt)
+        log.setLevel(logging.INFO)
+        log.addHandler(handler)
+        log.addHandler(sh)
+    return log
 
 logger = setup_logger()
 
-# Конфигурации
+# dataclasses
 @dataclass
 class WatermarkParams:
     threshold: int = 220
@@ -108,43 +116,52 @@ class ProcessingConfig:
     inp: Path = Path("./input")
     outp: Path = Path("./output")
 
-
-# Вспомогательные функции
+# helpers
 def ensure_dir(p: Path):
     try:
         p.mkdir(parents=True, exist_ok=True)
-    except:
+    except Exception:
         logger.exception("ensure_dir failed for %s", p)
 
-def save_params(params: WatermarkParams, filename: str):
+def save_json(obj, filename: str):
     try:
         with open(filename, "w", encoding="utf-8") as f:
-            json.dump(asdict(params), f, ensure_ascii=False, indent=2)
-    except:
-        logger.exception("save_params failed")
+            json.dump(obj, f, ensure_ascii=False, indent=2)
+    except Exception:
+        logger.exception("save_json failed for %s", filename)
 
-def load_params(filename: str) -> WatermarkParams:
+def load_json(filename: str) -> Optional[dict]:
     p = Path(filename)
     if not p.exists():
-        return WatermarkParams()
+        return None
     try:
         with p.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        merged = {**WatermarkParams().__dict__, **(data or {})}
+            return json.load(f)
+    except Exception:
+        logger.exception("load_json failed for %s", filename)
+        return None
+
+def save_params(params: WatermarkParams, filename: str):
+    save_json(asdict(params), filename)
+
+def load_params(filename: str) -> WatermarkParams:
+    data = load_json(filename)
+    if not data:
+        return WatermarkParams()
+    merged = {**WatermarkParams().__dict__, **data}
+    try:
         return WatermarkParams(**merged).normalized()
-    except:
-        logger.exception("load_params failed")
+    except Exception:
+        logger.exception("Invalid params file, using defaults")
         return WatermarkParams()
 
 def load_config(filename: str = "ppp_config.json") -> ProcessingConfig:
-    p = Path(filename)
-    if not p.exists():
+    data = load_json(filename)
+    if not data:
         return ProcessingConfig()
     try:
-        with p.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-        wm = data.get("wm_params", {})
-        wm_params = WatermarkParams(**{**WatermarkParams().__dict__, **(wm or {})}).normalized()
+        wm = data.get("wm_params", {}) or {}
+        wm_params = WatermarkParams(**{**WatermarkParams().__dict__, **wm}).normalized()
         cfg = ProcessingConfig(
             remove_bg=bool(data.get("remove_bg", True)),
             remove_wm=bool(data.get("remove_wm", True)),
@@ -157,35 +174,35 @@ def load_config(filename: str = "ppp_config.json") -> ProcessingConfig:
             outp=Path(str(data.get("outp", "./output"))),
         )
         return cfg
-    except:
-        logger.exception("load_config failed")
+    except Exception:
+        logger.exception("load_config failed, returning defaults")
         return ProcessingConfig()
 
-# Удаление фона
+# background removal
 def remove_background(pil_img: Image.Image, cfg: ProcessingConfig) -> Image.Image:
     if not cfg.remove_bg or not HAS_REMBG or rembg_remove is None:
         return pil_img
     try:
         buf = io.BytesIO()
         pil_img.save(buf, format="PNG")
-        buf.seek(0)
-        out = rembg_remove(buf.read())
+        out = rembg_remove(buf.getvalue())
         return Image.open(io.BytesIO(out)).convert("RGBA")
-    except:
+    except Exception:
         logger.exception("remove_background failed")
         return pil_img
 
-# Модель сегментации
+# model segmentation (optional)
 def segment_watermark_with_model(pil_img: Image.Image) -> np.ndarray:
     if model_session is None:
         return np.zeros((pil_img.height, pil_img.width), dtype=np.uint8)
     try:
-        inp_shape = model_session.get_inputs()[0].shape
-        _, c, h, w = inp_shape if len(inp_shape) == 4 else (1, 3, 256, 256)
+        inp_meta = model_session.get_inputs()[0].shape
+        # assume (1,C,H,W) or similar
+        _, c, h, w = inp_meta if len(inp_meta) == 4 else (1, 3, 256, 256)
         resized = pil_img.resize((w, h))
-        arr = np.array(resized).astype(np.float32) / 255
+        arr = np.asarray(resized).astype(np.float32) / 255.0
         if arr.ndim == 2:
-            arr = np.stack([arr] * 3, -1)
+            arr = np.stack([arr] * 3, axis=-1)
         if arr.shape[2] == 4:
             arr = arr[..., :3]
         tensor = np.transpose(arr, (2, 0, 1))[np.newaxis, ...]
@@ -193,162 +210,135 @@ def segment_watermark_with_model(pil_img: Image.Image) -> np.ndarray:
         outputs = model_session.run(None, {input_name: tensor})
         pred = outputs[0]
         pred_map = pred[0, 0] if pred.ndim == 4 else pred[0]
-        mask_resized = cv2.resize(pred_map.astype(np.float32), (pil_img.width, pil_img.height))
-        mask_bin = (mask_resized > 0.5).astype(np.uint8) * 255
-        return mask_bin
-    except:
+        mask = cv2.resize(pred_map.astype(np.float32), (pil_img.width, pil_img.height))
+        return (mask > 0.5).astype(np.uint8) * 255
+    except Exception:
         logger.exception("segment_watermark_with_model failed")
         return np.zeros((pil_img.height, pil_img.width), dtype=np.uint8)
 
-# Автоматическое определение порога
-def auto_threshold(gray_img: np.ndarray) -> int:
-    hist = cv2.calcHist([gray_img], [0], None, [256], [0, 256])
-    total = gray_img.size
-    cumsum = 0
-    threshold = 0
-    for i in range(256):
-        cumsum += hist[i][0]
-        if cumsum > total * 0.8:
-            threshold = i
-            break
-    return threshold
+# adaptive auto-threshold using histogram percentile
+def auto_threshold(gray: np.ndarray, percentile: float = 0.80) -> int:
+    if gray.size == 0:
+        return 220
+    hist, bins = np.histogram(gray.flatten(), bins=256, range=(0, 255))
+    cumsum = np.cumsum(hist)
+    total = gray.size
+    idx = np.searchsorted(cumsum, total * percentile)
+    return int(idx if 0 <= idx < 256 else 220)
 
-# Детекция водяных знаков по thresholding
+# traditional detection
 def detect_watermark_auto(pil_img: Image.Image, params: WatermarkParams) -> np.ndarray:
     params = params.normalized()
-    rgb = np.array(pil_img.convert("RGB"))
+    rgb = np.asarray(pil_img.convert("RGB"))
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    # Автоматический подбор порога
-    auto_thresh = auto_threshold(gray)
-    threshold_value = max(int(params.threshold), auto_thresh)
-
+    auto_t = auto_threshold(gray)
+    threshold_value = max(int(params.threshold), auto_t)
     if params.adaptive:
         try:
             thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
                                         cv2.THRESH_BINARY, params.block_size, params.c)
-        except:
+        except Exception:
             _, thr = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
     else:
         _, thr = cv2.threshold(gray, threshold_value, 255, cv2.THRESH_BINARY)
-
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel, iterations=2)
     thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, kernel, iterations=1)
-
     contours, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     mask = np.zeros_like(gray, dtype=np.uint8)
-
     for c in contours:
         area = cv2.contourArea(c)
         if area < params.min_area or area > params.max_area:
             continue
         x, y, w, h = cv2.boundingRect(c)
-        roi_gray = gray[y:y+h, x:x+w]
-        if roi_gray.size == 0:
+        roi = gray[y:y + h, x:x + w]
+        if roi.size == 0:
             continue
-        roi_mean = float(np.mean(roi_gray))
+        roi_mean = float(np.mean(roi))
         pad = 5
         x1, y1 = max(0, x - pad), max(0, y - pad)
         x2, y2 = min(gray.shape[1], x + w + pad), min(gray.shape[0], y + h + pad)
-        bg_roi = gray[y1:y2, x1:x2]
-        if bg_roi.size == 0:
+        bg = gray[y1:y2, x1:x2]
+        if bg.size == 0:
             continue
-        bg_mean = float(np.mean(bg_roi))
+        bg_mean = float(np.mean(bg))
         if abs(roi_mean - bg_mean) < 15:
             continue
         cv2.drawContours(mask, [c], -1, 255, -1)
-
     return mask
 
-# Рефайн маски: удаление мелких объектов и заполнение дыр
+# refine mask
 def refine_mask(mask: np.ndarray, min_size: int = 100) -> np.ndarray:
-    nb_components, output, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
-    for i in range(1, nb_components):
-        if stats[i, cv2.CC_STAT_AREA] < min_size:
-            output[output == i] = 0
-    refined = np.zeros_like(mask)
-    for i in range(1, nb_components):
-        if stats[i, cv2.CC_STAT_AREA] >= min_size:
-            refined[output == i] = 255
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return refined
+    try:
+        nb, out, stats, _ = cv2.connectedComponentsWithStats((mask > 0).astype(np.uint8), connectivity=8)
+        refined = np.zeros_like(mask)
+        for i in range(1, nb):
+            if stats[i, cv2.CC_STAT_AREA] >= min_size:
+                refined[out == i] = 255
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        refined = cv2.morphologyEx(refined, cv2.MORPH_CLOSE, k, iterations=2)
+        return refined
+    except Exception:
+        logger.exception("refine_mask failed")
+        return mask
 
-# Основная функция удаления водяных знаков
-def remove_watermark(
-    img_cv: np.ndarray, 
-    cfg: ProcessingConfig, 
-    use_model: bool = True
-) -> np.ndarray:
+# remove watermark (combine model + traditional)
+def remove_watermark(img_cv: np.ndarray, cfg: ProcessingConfig, use_model: bool = True) -> np.ndarray:
     if not cfg.remove_wm:
         return img_cv
     try:
         cfg.wm_params = cfg.wm_params.normalized()
-        h_img, w_img = img_cv.shape[:2]
-        pil_img = Image.fromarray(cv2.cvtColor(img_cv[..., :3], cv2.COLOR_BGR2RGB))
-        # Объединение методов
-        masks = []
-
-        # Модель
+        h, w = img_cv.shape[:2]
+        rgb_pil = Image.fromarray(cv2.cvtColor(img_cv[..., :3], cv2.COLOR_BGR2RGB))
+        masks: List[np.ndarray] = []
         if use_model and model_session is not None:
-            masks.append(segment_watermark_with_model(pil_img))
-        # Thresholding
-        masks.append(detect_watermark_auto(pil_img, cfg.wm_params))
-        # Объединяем маски
-        combined_mask = np.zeros((h_img, w_img), dtype=np.uint8)
+            masks.append(segment_watermark_with_model(rgb_pil))
+        masks.append(detect_watermark_auto(rgb_pil, cfg.wm_params))
+        combined = np.zeros((h, w), dtype=np.uint8)
         for m in masks:
-            combined_mask = cv2.bitwise_or(combined_mask, m)
-        # Рефайн маски
-        combined_mask = refine_mask(combined_mask, min_size=100)
-
-        if np.count_nonzero(combined_mask) == 0:
-            logger.debug("Маска водяного знака не обнаружена")
+            if m.shape == combined.shape:
+                combined = cv2.bitwise_or(combined, m)
+        combined = refine_mask(combined, min_size=max(50, cfg.wm_params.min_area))
+        if np.count_nonzero(combined) == 0:
+            logger.debug("No watermark mask found")
             return img_cv
-
         has_alpha = img_cv.ndim == 3 and img_cv.shape[2] == 4
         bgr = img_cv[..., :3].copy()
-
-        # Inpaint
-        inpaint_telea = cv2.inpaint(bgr, combined_mask, max(1, int(cfg.wm_params.radius)), cv2.INPAINT_TELEA)
-        inpaint_ns = None
+        telea = cv2.inpaint(bgr, combined, max(1, int(cfg.wm_params.radius)), cv2.INPAINT_TELEA)
+        chosen = telea
         if cfg.wm_params.use_ns:
             try:
-                inpaint_ns = cv2.inpaint(bgr, combined_mask, max(1, int(cfg.wm_params.radius)), cv2.INPAINT_NS)
-            except:
-                logger.exception("INPAINT_NS не удалось, используем TELEA")
-        # Выбор лучшего результата
-        if inpaint_ns is not None:
-            telea_err = np.mean(np.abs(inpaint_telea - bgr))
-            ns_err = np.mean(np.abs(inpaint_ns - bgr))
-            chosen = inpaint_ns if ns_err <= telea_err else inpaint_telea
-        else:
-            chosen = inpaint_telea
-
+                ns = cv2.inpaint(bgr, combined, max(1, int(cfg.wm_params.radius)), cv2.INPAINT_NS)
+                m_bool = combined.astype(bool)
+                if m_bool.any():
+                    telea_err = float(np.mean(np.abs(telea[m_bool] - bgr[m_bool])))
+                    ns_err = float(np.mean(np.abs(ns[m_bool] - bgr[m_bool])))
+                    chosen = ns if ns_err <= telea_err else telea
+            except Exception:
+                logger.exception("INPAINT_NS failed, using TELEA")
         if has_alpha:
             out = cv2.cvtColor(chosen, cv2.COLOR_BGR2BGRA)
             out[..., 3] = img_cv[..., 3]
         else:
             out = chosen
         return out
-
-    except:
-        logger.exception("Ошибка при удалении водяных знаков")
+    except Exception:
+        logger.exception("remove_watermark error")
         return img_cv
 
-# Resize и сохранение
-def resize_cv(img_cv: np.ndarray, w_target: Optional[int], h_target: Optional[int]) -> np.ndarray:
+# resize & save
+def resize_cv(img_cv: np.ndarray, w_t: Optional[int], h_t: Optional[int]) -> np.ndarray:
     h, w = img_cv.shape[:2]
-    if not w_target and not h_target:
+    if not w_t and not h_t:
         return img_cv
-    if w_target and h_target:
-        return cv2.resize(img_cv, (w_target, h_target), interpolation=cv2.INTER_AREA)
-    if w_target:
-        scale = w_target / w
-        return cv2.resize(img_cv, (w_target, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
-    if h_target:
-        scale = h_target / h
-        return cv2.resize(img_cv, (max(1, int(w * scale)), h_target), interpolation=cv2.INTER_AREA)
+    if w_t and h_t:
+        return cv2.resize(img_cv, (w_t, h_t), interpolation=cv2.INTER_AREA)
+    if w_t:
+        scale = w_t / w
+        return cv2.resize(img_cv, (w_t, max(1, int(h * scale))), interpolation=cv2.INTER_AREA)
+    if h_t:
+        scale = h_t / h
+        return cv2.resize(img_cv, (max(1, int(w * scale)), h_t), interpolation=cv2.INTER_AREA)
     return img_cv
 
 def save_cv_image(img_cv: np.ndarray, out_path: Path, cfg: ProcessingConfig) -> bool:
@@ -368,53 +358,54 @@ def save_cv_image(img_cv: np.ndarray, out_path: Path, cfg: ProcessingConfig) -> 
         else:
             pil.save(out_path, fmt)
         return True
-    except:
+    except Exception:
         logger.exception("save_cv_image failed for %s", out_path)
         return False
 
-# Обработка одного изображения
+# processing a single image
 def process_image(in_path: Path, out_path: Path, cfg: ProcessingConfig, use_model_segmentation: bool = True) -> Tuple[bool, str]:
     try:
-        pil = Image.open(in_path)
-        pil = pil.convert("RGBA") if pil.mode in ("RGBA", "LA") else pil.convert("RGB")
-        pil = remove_background(pil, cfg)
-        img_cv = np.array(pil)
+        with Image.open(in_path) as pil:
+            pil = pil.convert("RGBA") if pil.mode in ("RGBA", "LA") else pil.convert("RGB")
+            pil = remove_background(pil, cfg)
+            img_cv = np.asarray(pil)
         if img_cv.ndim == 2:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_GRAY2BGR)
         elif img_cv.shape[2] == 3:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGB2BGR)
         elif img_cv.shape[2] == 4:
             img_cv = cv2.cvtColor(img_cv, cv2.COLOR_RGBA2BGRA)
-        # Удаление водяных знаков
         img_cv = remove_watermark(img_cv, cfg, use_model=use_model_segmentation)
         out_final = out_path.with_suffix("." + cfg.fmt.lower())
         if save_cv_image(img_cv, out_final, cfg):
             return True, ""
-        return False, f"Ошибка при сохранении {out_final}"
+        return False, f"Failed to save {out_final}"
     except UnidentifiedImageError:
-        return False, f"Некорректное изображение: {in_path.name}"
-    except:
-        logger.exception("Ошибка обработки %s", in_path)
-        return False, "Ошибка обработки"
+        return False, f"Unidentified image: {in_path.name}"
+    except Exception:
+        logger.exception("process_image failed for %s", in_path)
+        return False, "processing error"
 
-# Базовая валидация расширений
+# batch
 def validate_ext(p: Path) -> bool:
     return p.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
 
-# Обработка каталога
-def process_batch(input_dir: Path, output_dir: Path, cfg: ProcessingConfig, max_workers: int = 4, use_model_segmentation: bool = True):
+def process_batch(input_dir: Path, output_dir: Path, cfg: ProcessingConfig, max_workers: int = 4, use_model_segmentation: Optional[bool] = None):
     ensure_dir(input_dir)
     ensure_dir(output_dir)
+    if use_model_segmentation is None:
+        use_model_segmentation = model_session is not None
     files = [p for p in sorted(input_dir.iterdir()) if p.is_file() and validate_ext(p)]
     results: List[Tuple[Path, bool, str]] = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = {ex.submit(process_image, p, output_dir / p.stem, cfg, use_model_segmentation): p for p in files}
-        for f in concurrent.futures.as_completed(futures):
-            p = futures[f]
+        for fut in concurrent.futures.as_completed(futures):
+            p = futures[fut]
             try:
-                ok, msg = f.result()
+                ok, msg = fut.result()
                 results.append((p, ok, msg))
             except Exception as e:
+                logger.exception("Worker raised")
                 results.append((p, False, str(e)))
     return results
 
@@ -429,22 +420,22 @@ def zip_results(out_dir: Path, results: List[Tuple[Path, bool, str]], format_ext
             if fp.exists():
                 try:
                     zf.write(fp, arcname=fname)
-                except:
-                    logger.exception("Ошибка при добавлении файла в ZIP: %s", fp)
+                except Exception:
+                    logger.exception("Failed to add to ZIP: %s", fp)
     buf.seek(0)
     return buf.read()
 
 # CLI
 def run_cli(argv=None):
     parser = argparse.ArgumentParser(description="Photo Processor Pro CLI")
-    parser.add_argument("--input", type=Path, default=Path("./input"), help="Входная папка (по умолчанию ./input)")
-    parser.add_argument("--output", type=Path, default=Path("./output"), help="Выходная папка (по умолчанию ./output)")
-    parser.add_argument("--calibrate", action="store_true", help="Калибровка (анализ и сохранение параметров)")
-    parser.add_argument("--params_file", type=str, default="detected_params.json", help="Файл параметров")
-    parser.add_argument("--remove_bg", action="store_true", help="Удалить фон")
-    parser.add_argument("--remove_wm", action="store_true", help="Удалить водяные знаки")
-    parser.add_argument("--use_model", action="store_true", help="Использовать ONNX модель для сегментации")
-    parser.add_argument("--workers", type=int, default=4, help="Потоки")
+    parser.add_argument("--input", type=Path, default=Path("./input"))
+    parser.add_argument("--output", type=Path, default=Path("./output"))
+    parser.add_argument("--calibrate", action="store_true")
+    parser.add_argument("--params_file", type=str, default="detected_params.json")
+    parser.add_argument("--remove_bg", action="store_true")
+    parser.add_argument("--remove_wm", action="store_true")
+    parser.add_argument("--use_model", action="store_true")
+    parser.add_argument("--workers", type=int, default=4)
     args = parser.parse_args(argv)
 
     cfg = ProcessingConfig(inp=args.input, outp=args.output)
@@ -458,15 +449,15 @@ def run_cli(argv=None):
         sample = next(cfg.inp.glob("*.*"), None)
         if sample:
             try:
-                pil = Image.open(sample)
-                params = detect_watermark_auto(pil, WatermarkParams())
-                save_params(params, args.params_file)
-                print(f"Параметры сохранены в {args.params_file}")
-            except:
-                logger.exception("Калибровка не удалась")
-                print("Калибровка не удалась")
+                with Image.open(sample) as pil:
+                    params = detect_watermark_auto(pil, WatermarkParams())
+                    save_params(params.__dict__, args.params_file)
+                    print(f"Saved params to {args.params_file}")
+            except Exception:
+                logger.exception("Calibration failed")
+                print("Calibration failed")
         else:
-            print("Нет файлов для калибровки")
+            print("No files for calibration")
         return
 
     cfg.wm_params = load_params(args.params_file)
@@ -474,10 +465,10 @@ def run_cli(argv=None):
     for p, ok, msg in results:
         print(f"{'✓' if ok else '✗'} {p.name}: {msg}")
 
-# Streamlit UI
+# Streamlit
 def run_streamlit():
     if st is None:
-        raise RuntimeError("Streamlit не установлен")
+        raise RuntimeError("Streamlit not installed")
     cfg = load_config()
     st.title("Photo Processor Pro — обработка изображений")
     st.sidebar.header("Настройки")
@@ -549,16 +540,16 @@ def run_streamlit():
                     try:
                         img = Image.open(img_path)
                         cols[i % 3].image(img, caption=p.name, width=300)
-                    except:
-                        logger.exception("Не удалось отобразить %s", img_path)
+                    except Exception:
+                        logger.exception("Failed to display %s", img_path)
 
     if temp_dir and temp_dir.exists():
         try:
             shutil.rmtree(temp_dir)
-        except:
-            logger.exception("Ошибка при удалении временной папки")
+        except Exception:
+            logger.exception("Failed to cleanup temp_dir")
 
-# Главная точка входа
+# entrypoint
 def main():
     if HAS_STREAMLIT and len(sys.argv) <= 1:
         run_streamlit()
