@@ -1,341 +1,379 @@
-import streamlit as st
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw
 import torch
-import torchvision.transforms as T
-from torchvision.models import detection
-from lama_cleaner.model_manager import ModelManager
-from lama_cleaner.schema import Config
-import io
-import tempfile
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
 import os
-from typing import List, Tuple
-import time
+import matplotlib.pyplot as plt
+from torchvision import transforms
+import sys
+import argparse
+import subprocess
+from pathlib import Path
 
-# Настройки страницы
-st.set_page_config(
-    page_title="AI Watermark Remover Pro",
-    page_icon="🎨",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# -------------------- Утилиты обработки из watermark_tool.py --------------------
 
-# Инициализация состояния сессии
-if 'processed_images' not in st.session_state:
-    st.session_state.processed_images = []
-if 'selected_model' not in st.session_state:
-    st.session_state.selected_model = "lama"
-if 'mask_points' not in st.session_state:
-    st.session_state.mask_points = []
-if 'drawing_mode' not in st.session_state:
-    st.session_state.drawing_mode = False
+class WatermarkUtils:
+    @staticmethod
+    def make_sample_image() -> np.ndarray:
+        """Создать простое тестовое изображение (BGR numpy array)."""
+        h, w = 400, 700
+        img = np.full((h, w, 3), 230, dtype=np.uint8)
+        cv2.putText(img, "SAMPLE IMAGE", (40, 180), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (80, 80, 200), 4, cv2.LINE_AA)
+        cv2.putText(img, "WATERMARK", (300, 320), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2, cv2.LINE_AA)
+        return img
 
-class WatermarkRemover:
-    def __init__(self):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.models = {}
-        self.current_model = None
+    @staticmethod
+    def load_image(path: str) -> np.ndarray | None:
+        """Загрузить изображение в BGR numpy array. Возвращает None при ошибке."""
+        if path is None:
+            return None
+        p = Path(path)
+        if not p.exists():
+            print(f"Файл не найден: {path}")
+            return None
         
-    def load_model(self, model_name: str):
-        """Загрузка выбранной модели"""
-        try:
-            if model_name == "lama" and "lama" not in self.models:
-                st.info("🔄 Загрузка LaMa модели...")
-                self.models["lama"] = ModelManager(
-                    name="lama",
-                    device=self.device
-                )
-                
-            elif model_name == "gfpgan" and "gfpgan" not in self.models:
-                st.info("🔄 Загрузка GFPGAN модели...")
-                # Здесь будет код для GFPGAN
-                pass
-                
-            elif model_name == "detection" and "detection" not in self.models:
-                st.info("🔄 Загрузка модели детекции...")
-                self.models["detection"] = detection.maskrcnn_resnet50_fpn(
-                    pretrained=True
-                ).to(self.device).eval()
-                
-            self.current_model = model_name
-            return True
-            
-        except Exception as e:
-            st.error(f"❌ Ошибка загрузки модели: {e}")
-            return False
+        pil = Image.open(str(p)).convert("RGB")
+        arr = np.array(pil)[:, :, ::-1]  # RGB -> BGR
+        return arr
 
-    def auto_detect_watermark(self, image: np.ndarray) -> np.ndarray:
-        """Автоматическое обнаружение водяных знаков"""
-        if "detection" not in self.models:
-            self.load_model("detection")
-        
-        transform = T.Compose([T.ToTensor()])
-        input_tensor = transform(image).unsqueeze(0).to(self.device)
-        
-        with torch.no_grad():
-            predictions = self.models["detection"](input_tensor)
-        
-        # Создание маски на основе предсказаний
-        mask = np.zeros(image.shape[:2], dtype=np.uint8)
-        
-        for score, label, box, mask_pred in zip(
-            predictions[0]['scores'], predictions[0]['labels'],
-            predictions[0]['boxes'], predictions[0]['masks']
-        ):
-            if score > 0.7:  # Порог уверенности
-                mask_pred = mask_pred[0].cpu().numpy() > 0.5
-                mask[mask_pred] = 255
-        
-        return mask
+    @staticmethod
+    def save_image_bgr(img_bgr: np.ndarray, out_path: str) -> None:
+        """Сохранить BGR numpy в файл."""
+        p = Path(out_path)
+        pil = Image.fromarray(img_bgr[:, :, ::-1])  # BGR -> RGB
+        pil.save(str(p))
 
-    def remove_watermark(
-        self, 
-        image: np.ndarray, 
-        mask: np.ndarray,
-        config: Config
-    ) -> np.ndarray:
-        """Удаление водяного знака с помощью выбранной модели"""
-        if self.current_model == "lama":
-            return self._remove_with_lama(image, mask, config)
-        elif self.current_model == "gfpgan":
-            return self._remove_with_gfpgan(image, mask)
+    @staticmethod
+    def detect_watermark_areas(image_path, threshold=200):
+        """
+        Автоматическое обнаружение областей с водяными знаками
+        """
+        img = WatermarkUtils.load_image(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Бинаризация для выделения светлых областей
+        _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
+        
+        # Находим контуры
+        contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        watermark_areas = []
+        for contour in contours:
+            if cv2.contourArea(contour) > 100:  # Минимальная площадь
+                x, y, w, h = cv2.boundingRect(contour)
+                watermark_areas.append((x, y, w, h))
+        
+        return watermark_areas
+
+    @staticmethod
+    def make_mask_from_gray(gray: np.ndarray, thresh: int = 150, invert: bool = False, k: int = 5) -> np.ndarray:
+        """Создать бинарную маску из серого изображения (uint8 0/255)."""
+        _, m = cv2.threshold(gray, int(thresh), 255, cv2.THRESH_BINARY)
+        if invert:
+            m = cv2.bitwise_not(m)
+        if k > 1:
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
+            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
+        return m.astype(np.uint8)
+
+    @staticmethod
+    def inpaint_bgr(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Выполнить inpaint с помощью cv2."""
+        m = mask.astype(np.uint8)
+        return cv2.inpaint(img_bgr, m, 3, cv2.INPAINT_TELEA)
+
+    @staticmethod
+    def overlay_mask_on_bgr(img_bgr: np.ndarray, mask: np.ndarray, color: tuple = (0, 0, 255), alpha: float = 0.3) -> np.ndarray:
+        """
+        Наложить цветную полупрозрачную маску на BGR-изображение.
+        color - (B,G,R) значение 0-255 для подсветки.
+        mask - uint8 0/255, single channel.
+        alpha - непрозрачность маски (0..1).
+        Возвращает BGR uint8.
+        """
+        img = img_bgr.copy().astype(np.float32)
+        overlay = np.zeros_like(img, dtype=np.float32)
+        # Broadcast mask to 3 channels and set color
+        if mask.ndim == 2:
+            m3 = np.stack([mask]*3, axis=-1) / 255.0  # 0..1
         else:
-            return image
+            m3 = (mask.astype(np.uint8) != 0).astype(np.float32)
+        overlay[:, :, 0] = color[0]
+        overlay[:, :, 1] = color[1]
+        overlay[:, :, 2] = color[2]
+        # Blend only where mask is present
+        alpha_mask = (m3[..., 0] > 0).astype(np.float32) * alpha
+        alpha_mask = np.expand_dims(alpha_mask, axis=-1)
+        out = img * (1.0 - alpha_mask) + overlay * alpha_mask
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        return out
 
-    def _remove_with_lama(self, image: np.ndarray, mask: np.ndarray, config: Config) -> np.ndarray:
-        """Удаление с помощью LaMa"""
-        try:
-            result = self.models["lama"](image, mask, config)
-            return result
-        except Exception as e:
-            st.error(f"Ошибка обработки LaMa: {e}")
-            return image
+    @staticmethod
+    def blend_images(original, processed, alpha=0.7):
+        """
+        Смешивание оригинального и обработанного изображения
+        """
+        return cv2.addWeighted(original, alpha, processed, 1 - alpha, 0)
 
-    def _remove_with_gfpgan(self, image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Удаление с помощью GFPGAN"""
-        # Заглушка для GFPGAN реализации
+# -------------------- Нейросетевая часть --------------------
+
+class WatermarkDataset(Dataset):
+    def __init__(self, image_dir, transform=None):
+        self.image_dir = image_dir
+        self.transform = transform
+        self.images = os.listdir(image_dir)
+    
+    def __len__(self):
+        return len(self.images)
+    
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.images[idx])
+        image = Image.open(img_path).convert('RGB')
+        
+        if self.transform:
+            image = self.transform(image)
+        
         return image
 
-def create_mask_from_points(image_size: Tuple[int, int], points: List[Tuple[int, int]]) -> np.ndarray:
-    """Создание маски из точек"""
-    mask = Image.new('L', image_size, 0)
-    if points:
-        draw = ImageDraw.Draw(mask)
-        for i in range(len(points) - 1):
-            draw.line([points[i], points[i + 1]], fill=255, width=20)
-        draw.line([points[-1], points[0]], fill=255, width=20)
-    return np.array(mask)
+class WatermarkRemoverCNN(nn.Module):
+    def __init__(self):
+        super(WatermarkRemoverCNN, self).__init__()
+        
+        self.encoder = nn.Sequential(
+            nn.Conv2d(3, 64, 4, stride=2, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(64, 128, 4, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU()
+        )
+        
+        self.decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.ConvTranspose2d(64, 3, 4, stride=2, padding=1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        x = self.encoder(x)
+        x = self.decoder(x)
+        return x
+
+class WatermarkRemover:
+    def __init__(self, model_path=None):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = WatermarkRemoverCNN().to(self.device)
+        self.utils = WatermarkUtils()
+        
+        if model_path and os.path.exists(model_path):
+            self.model.load_state_dict(torch.load(model_path, map_location=self.device))
+        
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(self.model.parameters(), lr=0.001)
+    
+    def remove_watermark_simple(self, image_path, watermark_coords=None, thresh=150, invert=False, kernel=5):
+        """
+        Удаление водяного знака методом клонирования (OpenCV)
+        """
+        img = self.utils.load_image(image_path)
+        
+        if watermark_coords is None:
+            # Автоматическое обнаружение водяных знаков
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            mask = self.utils.make_mask_from_gray(gray, thresh=thresh, invert=invert, k=kernel)
+        else:
+            # Используем предоставленные координаты
+            mask = np.zeros(img.shape[:2], np.uint8)
+            for coord in watermark_coords:
+                x, y, w, h = coord
+                mask[y:y+h, x:x+w] = 255
+        
+        # Применяем inpainting
+        result = self.utils.inpaint_bgr(img, mask)
+        
+        return cv2.cvtColor(result, cv2.COLOR_BGR2RGB), mask
+    
+    def train(self, train_loader, epochs=10, save_path='watermark_remover_model.pth'):
+        """
+        Обучение нейросетевой модели
+        """
+        self.model.train()
+        for epoch in range(epochs):
+            total_loss = 0
+            for batch in train_loader:
+                batch = batch.to(self.device)
+                
+                self.optimizer.zero_grad()
+                outputs = self.model(batch)
+                loss = self.criterion(outputs, batch)
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+            
+            print(f'Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(train_loader):.4f}')
+        
+        # Сохранение модели после обучения
+        torch.save(self.model.state_dict(), save_path)
+        print(f'Model saved to {save_path}')
+    
+    def remove_watermark_advanced(self, image_path):
+        """
+        Удаление водяного знака с помощью нейросети
+        """
+        self.model.eval()
+        with torch.no_grad():
+            # Загрузка и преобразование изображения
+            image = Image.open(image_path).convert('RGB')
+            
+            transform = transforms.Compose([
+                transforms.Resize((256, 256)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+            ])
+            
+            input_tensor = transform(image).unsqueeze(0).to(self.device)
+            output = self.model(input_tensor)
+            
+            # Конвертируем обратно в изображение
+            output_image = output.squeeze(0).cpu().numpy()
+            output_image = np.transpose(output_image, (1, 2, 0))
+            output_image = (output_image * 255).astype(np.uint8)
+            
+            return output_image
+    
+    def compare_results(self, image_path, watermark_coords=None, thresh=150, invert=False, kernel=5):
+        """
+        Сравнение результатов разных методов
+        """
+        original = self.utils.load_image(image_path)
+        original_rgb = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
+        
+        # Простое удаление
+        simple_result, mask = self.remove_watermark_simple(image_path, watermark_coords, thresh, invert, kernel)
+        
+        # Визуализация маски с наложением
+        mask_preview = self.utils.overlay_mask_on_bgr(original, mask, color=(0, 0, 255), alpha=0.35)
+        mask_preview_rgb = cv2.cvtColor(mask_preview, cv2.COLOR_BGR2RGB)
+        
+        # Нейросетевое удаление (если модель обучена)
+        try:
+            advanced_result = self.remove_watermark_advanced(image_path)
+            has_advanced = True
+        except:
+            advanced_result = original_rgb
+            has_advanced = False
+        
+        # Визуализация результатов
+        plt.figure(figsize=(15, 10 if has_advanced else 15))
+        
+        plt.subplot(2, 2, 1)
+        plt.imshow(original_rgb)
+        plt.title('Оригинал')
+        plt.axis('off')
+        
+        plt.subplot(2, 2, 2)
+        plt.imshow(mask_preview_rgb)
+        plt.title('Обнаруженная маска')
+        plt.axis('off')
+        
+        plt.subplot(2, 2, 3)
+        plt.imshow(simple_result)
+        plt.title('Простое удаление (inpaint)')
+        plt.axis('off')
+        
+        if has_advanced:
+            plt.subplot(2, 2, 4)
+            plt.imshow(advanced_result)
+            plt.title('Нейросетевое удаление')
+            plt.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+        
+        return simple_result, advanced_result if has_advanced else simple_result
+
+# -------------------- CLI интерфейс --------------------
+
+def run_cli(args):
+    """Выполнить обработку через CLI."""
+    remover = WatermarkRemover(args.model)
+    
+    if args.input is None:
+        print("Входной файл не указан: создаю тестовое изображение.")
+        img = WatermarkUtils.make_sample_image()
+        WatermarkUtils.save_image_bgr(img, "sample_input.png")
+        image_path = "sample_input.png"
+    else:
+        image_path = args.input
+    
+    if args.method == "simple":
+        result, _ = remover.remove_watermark_simple(
+            image_path, 
+            watermark_coords=None if args.auto_detect else [(args.x, args.y, args.w, args.h)],
+            thresh=args.thresh,
+            invert=args.invert,
+            kernel=args.kernel
+        )
+    elif args.method == "advanced":
+        result = remover.remove_watermark_advanced(image_path)
+    else:  # compare
+        result_simple, result_advanced = remover.compare_results(
+            image_path,
+            watermark_coords=None if args.auto_detect else [(args.x, args.y, args.w, args.h)],
+            thresh=args.thresh,
+            invert=args.invert,
+            kernel=args.kernel
+        )
+        result = result_advanced
+    
+    out = args.output or "result.png"
+    # Convert RGB to BGR for saving
+    result_bgr = cv2.cvtColor(result, cv2.COLOR_RGB2BGR)
+    WatermarkUtils.save_image_bgr(result_bgr, out)
+    print(f"Готово: {out}")
+    return 0
 
 def main():
-    st.title("🎨 AI Watermark Remover Pro")
-    st.markdown("Мощный инструмент для удаления водяных знаков с использованием AI")
+    parser = argparse.ArgumentParser(description="Watermark Removal Tool")
+    parser.add_argument("--input", "-i", help="Входной файл изображения")
+    parser.add_argument("--output", "-o", help="Выходной файл")
+    parser.add_argument("--method", "-m", choices=["simple", "advanced", "compare"], 
+                       default="compare", help="Метод удаления водяного знака")
+    parser.add_argument("--model", help="Путь к предобученной модели")
+    parser.add_argument("--thresh", type=int, default=150, help="Порог для бинаризации")
+    parser.add_argument("--invert", action="store_true", help="Инвертировать маску")
+    parser.add_argument("--kernel", type=int, default=5, help="Размер ядра морфологии")
+    parser.add_argument("--auto-detect", action="store_true", help="Автоматическое обнаружение водяного знака")
+    parser.add_argument("--x", type=int, default=0, help="X координата водяного знака")
+    parser.add_argument("--y", type=int, default=0, help="Y координата водяного знака")
+    parser.add_argument("--w", type=int, default=100, help="Ширина водяного знака")
+    parser.add_argument("--h", type=int, default=50, help="Высота водяного знака")
     
-    # Инициализация обработчика
-    remover = WatermarkRemover()
+    args = parser.parse_args()
     
-    # Сайдбар с настройками
-    with st.sidebar:
-        st.header("⚙️ Настройки")
-        
-        # Выбор модели
-        model_choice = st.selectbox(
-            "Выберите модель",
-            ["lama", "gfpgan"],
-            index=0,
-            help="LaMa - для общего удаления, GFPGAN - для лиц"
-        )
-        
-        # Настройки обработки
-        st.subheader("Параметры обработки")
-        hd_option = st.checkbox("HD режим", False)
-        quality = st.slider("Качество обработки", 1, 10, 7)
-        
-        # Пакетная обработка
-        st.subheader("Пакетная обработка")
-        batch_files = st.file_uploader(
-            "Выберите несколько изображений",
-            type=['jpg', 'jpeg', 'png'],
-            accept_multiple_files=True
-        )
-        
-        if st.button("🚀 Обработать все", type="primary") and batch_files:
-            process_batch(remover, batch_files, model_choice, hd_option, quality)
-
-    # Основная область
-    tab1, tab2, tab3 = st.tabs(["📤 Загрузка", "🎯 Выбор области", "⚡ Обработка"])
-    
-    with tab1:
-        uploaded_file = st.file_uploader(
-            "Загрузите изображение с водяным знаком",
-            type=['png', 'jpg', 'jpeg'],
-            key="main_uploader"
-        )
-        
-        if uploaded_file:
-            image = Image.open(uploaded_file).convert('RGB')
-            st.session_state.original_image = np.array(image)
-            st.image(image, caption="Исходное изображение", use_column_width=True)
-            
-            # Автодетекция
-            if st.button("🔍 Автоматическое обнаружение водяных знаков"):
-                with st.spinner("Ищем водяные знаки..."):
-                    mask = remover.auto_detect_watermark(st.session_state.original_image)
-                    if mask.any():
-                        st.session_state.auto_mask = mask
-                        st.success("Найдены потенциальные водяные знаки!")
-                        st.image(mask, caption="Обнаруженная область", use_column_width=True)
-                    else:
-                        st.warning("Водяные знаки не обнаружены автоматически")
-
-    with tab2:
-        if 'original_image' in st.session_state:
-            st.subheader("Выделите область водяного знака")
-            
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Интерактивное выделение
-                if st.button("✏️ Режим рисования"):
-                    st.session_state.drawing_mode = not st.session_state.drawing_mode
-                
-                if st.session_state.drawing_mode:
-                    st.info("Кликните на изображении чтобы добавить точки")
-                    
-                    # Отображение изображения для кликов
-                    fig = st.empty()
-                    fig.image(st.session_state.original_image, use_column_width=True)
-                    
-                    # Обработка кликов
-                    points = st.session_state.get('mask_points', [])
-                    if fig.clickable:
-                        click_data = fig.get_click_data()
-                        if click_data:
-                            x, y = click_data['x'], click_data['y']
-                            points.append((x, y))
-                            st.session_state.mask_points = points
-                
-                if st.button("🧹 Очистить выделение"):
-                    st.session_state.mask_points = []
-                
-                if st.button("✅ Применить выделение"):
-                    if st.session_state.mask_points:
-                        mask = create_mask_from_points(
-                            st.session_state.original_image.shape[:2][::-1],
-                            st.session_state.mask_points
-                        )
-                        st.session_state.custom_mask = mask
-                        st.success("Маска создана!")
-            
-            with col2:
-                if 'custom_mask' in st.session_state:
-                    st.image(st.session_state.custom_mask, caption="Ваша маска", use_column_width=True)
-
-    with tab3:
-        if 'original_image' in st.session_state:
-            st.subheader("Обработка изображения")
-            
-            if st.button("✨ Запустить обработку", type="primary"):
-                # Загрузка модели
-                if remover.load_model(model_choice):
-                    with st.spinner("Обрабатываем изображение..."):
-                        # Конфигурация обработки
-                        config = Config(
-                            ldm_steps=20,
-                            hd_strategy='Crop' if hd_option else 'Original',
-                            quality=quality
-                        )
-                        
-                        # Выбор маски
-                        if 'custom_mask' in st.session_state:
-                            mask = st.session_state.custom_mask
-                        elif 'auto_mask' in st.session_state:
-                            mask = st.session_state.auto_mask
-                        else:
-                            st.error("Сначала создайте маску!")
-                            return
-                        
-                        # Обработка
-                        result = remover.remove_watermark(
-                            st.session_state.original_image,
-                            mask,
-                            config
-                        )
-                        
-                        # Сохранение результата
-                        st.session_state.processed_images.append(result)
-                        
-                        # Отображение
-                        col1, col2 = st.columns(2)
-                        with col1:
-                            st.image(st.session_state.original_image, 
-                                   caption="До", use_column_width=True)
-                        with col2:
-                            st.image(result, caption="После", use_column_width=True)
-                        
-                        # Кнопка скачивания
-                        result_pil = Image.fromarray(result)
-                        buf = io.BytesIO()
-                        result_pil.save(buf, format="PNG", quality=95)
-                        
-                        st.download_button(
-                            "📥 Скачать результат",
-                            buf.getvalue(),
-                            "watermark_removed.png",
-                            "image/png",
-                            use_container_width=True
-                        )
-
-def process_batch(remover, files, model_choice, hd_option, quality):
-    """Обработка нескольких изображений"""
-    progress_bar = st.progress(0)
-    results = []
-    
-    for i, file in enumerate(files):
-        try:
-            image = Image.open(file).convert('RGB')
-            img_array = np.array(image)
-            
-            # Автоматическое создание маски
-            mask = remover.auto_detect_watermark(img_array)
-            
-            # Обработка
-            config = Config(
-                ldm_steps=20,
-                hd_strategy='Crop' if hd_option else 'Original',
-                quality=quality
-            )
-            
-            result = remover.remove_watermark(img_array, mask, config)
-            results.append((file.name, result))
-            
-        except Exception as e:
-            st.error(f"Ошибка обработки {file.name}: {e}")
-        
-        progress_bar.progress((i + 1) / len(files))
-    
-    # Предоставление результатов для скачивания
-    for filename, result in results:
-        result_pil = Image.fromarray(result)
-        buf = io.BytesIO()
-        result_pil.save(buf, format="PNG", quality=95)
-        
-        st.download_button(
-            f"📥 Скачать {filename}",
-            buf.getvalue(),
-            f"processed_{filename}",
-            "image/png"
-        )
-
-# Информация о системе
-with st.sidebar:
-    st.markdown("---")
-    st.subheader("Системная информация")
-    st.write(f"Устройство: {remover.device}")
-    st.write(f"CUDA доступно: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        st.write(f"GPU: {torch.cuda.get_device_name(0)}")
-        st.write(f"Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    return run_cli(args)
 
 if __name__ == "__main__":
-    main()
+    # Если запущено как скрипт, использовать CLI
+    if len(sys.argv) > 1:
+        sys.exit(main())
+    
+    # Иначе показать пример использования
+    print("Watermark Removal Tool")
+    print("Использование: python script.py --input image.jpg --output result.png --method compare")
+    
+    # Создать пример и показать результат
+    remover = WatermarkRemover()
+    sample_img = WatermarkUtils.make_sample_image()
+    WatermarkUtils.save_image_bgr(sample_img, "sample_image.jpg")
+    
+    print("\nСоздан пример изображения: sample_image.jpg")
+    print("Запуск сравнения методов...")
+    
+    remover.compare_results("sample_image.jpg")
