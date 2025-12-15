@@ -199,7 +199,7 @@ def main():
     # Создание примера изображения
     if st.button("Создать пример изображения"):
         sample_img = processor.make_sample_image()
-        st.image(sample_img, caption="Пример изображения с водяным знаком", width=0)
+        st.image(sample_img, caption="Пример изображения с водяным знаком", width=None)
         
         img_bytes = processor.save_image(sample_img)
         st.download_button(
@@ -215,7 +215,7 @@ def main():
     if uploaded_file is not None:
         # Отображение оригинального изображения
         original_image = processor.load_image(uploaded_file)
-        st.image(original_image, caption="Оригинальное изображение", width=0)
+        st.image(original_image, caption="Оригинальное изображение", width=None)
         
         # Параметры обработки
         st.sidebar.header("Настройки обработки")
@@ -234,18 +234,18 @@ def main():
             mask = processor.apply_morphology(mask, kernel_size)
         
         # Показ маски
-        st.image(mask, caption="Обнаруженная маска", width=0, clamp=True)
+        st.image(mask, caption="Обнаруженная маска", width=None, clamp=True)
         
         # Показ маски наложенной на изображение
         masked_image = processor.overlay_mask(original_image, mask)
-        st.image(masked_image, caption="Маска на изображении", width=0)
+        st.image(masked_image, caption="Маска на изображении", width=None)
         
         # Удаление водяного знака
         if st.button("Удалить водяной знак"):
             with st.spinner("Обработка..."):
                 result = processor.remove_watermark(original_image, mask)
             
-            st.image(result, caption="Результат удаления", width=0)
+            st.image(result, caption="Результат удаления", width=None)
             
             # Кнопка скачивания
             result_bytes = processor.save_image(result)
