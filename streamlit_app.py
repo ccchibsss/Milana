@@ -1,34 +1,28 @@
 import streamlit as st
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 import io
-import os
 import sys
-from pathlib import Path
-import subprocess
 import platform
+import subprocess
+from pathlib import Path
 
-# Функция для установки пакетов
-def install_package(package_name):
+# Функция для безопасной установки пакетов
+def safe_install_package(package_name):
     try:
-        # Проверяем, какой пакетный менеджер доступен
-        if hasattr(sys, 'real_prefix') or hasattr(sys, 'base_prefix'):
-            # Мы в виртуальном окружении
-            pip_cmd = [sys.executable, "-m", "pip", "install", package_name]
+        result = subprocess.run([
+            sys.executable, "-m", "pip", "install", 
+            "--user", package_name
+        ], capture_output=True, text=True, timeout=120)
+        
+        if result.returncode == 0:
+            return True, result.stdout
         else:
-            pip_cmd = ["pip", "install", package_name]
-            
-        result = subprocess.run(
-            pip_cmd,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        return True, result.stdout
-    except subprocess.CalledProcessError as e:
-        return False, f"Ошибка установки {package_name}: {e.stderr}"
+            return False, result.stderr
+    except Exception as e:
+        return False, str(e)
 
-# Проверяем наличие OpenCV
+# Проверяем наличие необходимых пакетов
 try:
     import cv2
     OPENCV_AVAILABLE = True
@@ -36,174 +30,178 @@ except ImportError:
     OPENCV_AVAILABLE = False
     st.warning("OpenCV не установлен. Пытаемся установить...")
     
-    # Пробуем установить с разными вариантами
-    success, message = install_package("opencv-python-headless")
+    success, message = safe_install_package("opencv-python-headless")
     if success:
         try:
             import cv2
             OPENCV_AVAILABLE = True
-            st.success("OpenCV успешно установлен!")
+            st.success("✅ OpenCV успешно установлен!")
+            st.rerun()
         except ImportError:
             OPENCV_AVAILABLE = False
             st.error("OpenCV установлен, но импорт не работает")
-    else:
-        st.error(f"Не удалось установить OpenCV: {message}")
-        st.info("Попробуем альтернативный вариант...")
-        
-        # Пробуем другой пакет
-        success2, message2 = install_package("opencv-python")
-        if success2:
-            try:
-                import cv2
-                OPENCV_AVAILABLE = True
-                st.success("OpenCV успешно установлен!")
-            except ImportError:
-                OPENCV_AVAILABLE = False
-                st.error("OpenCV установлен, но импорт не работает")
-        else:
-            st.error(f"Не удалось установить OpenCV: {message2}")
 
-# Проверяем наличие torch
 try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torchvision import transforms
-    TORCH_AVAILABLE = True
+    import scipy
+    SCIPY_AVAILABLE = True
 except ImportError:
-    TORCH_AVAILABLE = False
-    st.warning("PyTorch не установлен. Нейросетевые функции будут недоступны.")
+    SCIPY_AVAILABLE = False
+    st.warning("SciPy не установлен. Пытаемся установить...")
+    
+    success, message = safe_install_package("scipy")
+    if success:
+        try:
+            import scipy
+            SCIPY_AVAILABLE = True
+            st.success("✅ SciPy успешно установлен!")
+            st.rerun()
+        except ImportError:
+            SCIPY_AVAILABLE = False
+            st.error("SciPy установлен, но импорт не работает")
 
-# -------------------- Утилиты обработки --------------------
-class WatermarkUtils:
+# Утилиты обработки изображений
+class ImageProcessor:
     @staticmethod
     def make_sample_image() -> np.ndarray:
-        """Создать простое тестовое изображение."""
+        """Создать тестовое изображение"""
         h, w = 400, 700
         img = np.full((h, w, 3), 230, dtype=np.uint8)
         
-        if OPENCV_AVAILABLE:
-            cv2.putText(img, "SAMPLE IMAGE", (40, 180), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (80, 80, 200), 4, cv2.LINE_AA)
-            cv2.putText(img, "WATERMARK", (300, 320), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2, cv2.LINE_AA)
-        else:
-            # Альтернатива без OpenCV
-            from PIL import ImageDraw, ImageFont
-            pil_img = Image.fromarray(img)
-            draw = ImageDraw.Draw(pil_img)
-            try:
-                font = ImageFont.truetype("arial.ttf", 40)
-                draw.text((40, 140), "SAMPLE IMAGE", fill=(80, 80, 200), font=font)
-                draw.text((300, 300), "WATERMARK", fill=(200, 200, 200), font=font)
-            except:
-                draw.text((40, 140), "SAMPLE IMAGE", fill=(80, 80, 200))
-                draw.text((300, 300), "WATERMARK", fill=(200, 200, 200))
-            img = np.array(pil_img)
+        pil_img = Image.fromarray(img)
+        draw = ImageDraw.Draw(pil_img)
         
-        return img
+        try:
+            font_large = ImageFont.truetype("arial.ttf", 40)
+            font_small = ImageFont.truetype("arial.ttf", 24)
+        except:
+            font_large = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+        
+        draw.text((40, 140), "SAMPLE IMAGE", fill=(80, 80, 200), font=font_large)
+        draw.text((300, 300), "WATERMARK", fill=(200, 200, 200), font=font_small)
+        
+        return np.array(pil_img)
 
     @staticmethod
     def load_image(uploaded_file) -> np.ndarray:
-        """Загрузить изображение из Streamlit uploaded file."""
+        """Загрузить изображение"""
         image = Image.open(uploaded_file).convert("RGB")
         return np.array(image)
 
     @staticmethod
     def save_image(image_array: np.ndarray) -> bytes:
-        """Сохранить изображение в bytes."""
+        """Сохранить изображение в bytes"""
         img_pil = Image.fromarray(image_array)
         buf = io.BytesIO()
         img_pil.save(buf, format="PNG")
         return buf.getvalue()
 
     @staticmethod
-    def make_mask_from_gray(gray: np.ndarray, thresh: int = 150, invert: bool = False, k: int = 5) -> np.ndarray:
-        """Создать бинарную маску из серого изображения."""
-        if not OPENCV_AVAILABLE:
-            # Простая альтернатива без OpenCV
-            mask = np.where(gray > thresh, 255, 0).astype(np.uint8)
+    def rgb_to_grayscale(rgb_image: np.ndarray) -> np.ndarray:
+        """Конвертация RGB в grayscale"""
+        return np.dot(rgb_image[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)
+
+    @staticmethod
+    def create_mask(gray_image: np.ndarray, threshold: int = 150, invert: bool = False) -> np.ndarray:
+        """Создать бинарную маску"""
+        if OPENCV_AVAILABLE:
+            _, mask = cv2.threshold(gray_image, threshold, 255, cv2.THRESH_BINARY)
             if invert:
-                mask = 255 - mask
+                mask = cv2.bitwise_not(mask)
             return mask
         
-        _, m = cv2.threshold(gray, int(thresh), 255, cv2.THRESH_BINARY)
+        mask = np.where(gray_image > threshold, 255, 0).astype(np.uint8)
         if invert:
-            m = cv2.bitwise_not(m)
-        if k > 1:
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kernel)
-            m = cv2.morphologyEx(m, cv2.MORPH_OPEN, kernel)
-        return m.astype(np.uint8)
+            mask = 255 - mask
+        return mask
 
     @staticmethod
-    def inpaint_bgr(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
-        """Выполнить inpaint."""
-        if not OPENCV_AVAILABLE:
-            # Простая альтернатива без OpenCV - размытие области
-            result = img_bgr.copy()
+    def apply_morphology(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+        """Применить морфологические операции"""
+        if not OPENCV_AVAILABLE or kernel_size <= 1:
+            return mask
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+        return mask
+
+    @staticmethod
+    def remove_watermark(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        """Удалить водяной знак"""
+        result = image.copy()
+        
+        if OPENCV_AVAILABLE:
+            # Используем OpenCV inpaint
+            return cv2.inpaint(image, mask.astype(np.uint8), 3, cv2.INPAINT_TELEA)
+        elif SCIPY_AVAILABLE:
+            # Используем scipy для размытия
             mask_bool = mask > 0
             
-            # Применяем размытие только к области маски
-            from scipy import ndimage
-            for c in range(3):
-                channel = result[:, :, c]
-                # Заменяем пиксели под маской на среднее значение окружающих пикселей
-                blurred = ndimage.gaussian_filter(channel, sigma=3)
-                channel[mask_bool] = blurred[mask_bool]
-                result[:, :, c] = channel
+            for channel in range(3):
+                channel_data = result[:, :, channel].copy()
+                blurred = scipy.ndimage.gaussian_filter(channel_data, sigma=3)
+                channel_data[mask_bool] = blurred[mask_bool]
+                result[:, :, channel] = channel_data
             
             return result
-        
-        m = mask.astype(np.uint8)
-        return cv2.inpaint(img_bgr, m, 3, cv2.INPAINT_TELEA)
+        else:
+            # Простая замена на среднее значение
+            mask_bool = mask > 0
+            for channel in range(3):
+                channel_data = result[:, :, channel].copy()
+                avg_value = np.mean(channel_data[~mask_bool])
+                channel_data[mask_bool] = avg_value
+                result[:, :, channel] = channel_data
+            
+            return result
 
     @staticmethod
-    def overlay_mask_on_image(img: np.ndarray, mask: np.ndarray, color: tuple = (255, 0, 0), alpha: float = 0.3) -> np.ndarray:
-        """Наложить маску на изображение."""
-        overlay = img.copy()
+    def overlay_mask(image: np.ndarray, mask: np.ndarray, color: tuple = (255, 0, 0), alpha: float = 0.3) -> np.ndarray:
+        """Наложить маску на изображение"""
+        overlay = image.copy()
         mask_indices = mask > 0
         
-        for c in range(3):
-            overlay[mask_indices, c] = (
-                overlay[mask_indices, c] * (1 - alpha) + 
-                color[c] * alpha
+        for channel in range(3):
+            overlay[mask_indices, channel] = (
+                overlay[mask_indices, channel] * (1 - alpha) + 
+                color[channel] * alpha
             )
         
         return overlay.astype(np.uint8)
 
-# -------------------- Streamlit App --------------------
-
+# Основное приложение
 def main():
     st.title("🖼️ Watermark Removal Tool")
     st.write("Удаление водяных знаков с изображений")
     
     # Информация о системе
     st.sidebar.header("Информация о системе")
-    st.sidebar.write(f"Python: {sys.version}")
+    st.sidebar.write(f"Python: {sys.version.split()[0]}")
     st.sidebar.write(f"Платформа: {platform.system()} {platform.release()}")
     st.sidebar.write(f"OpenCV доступен: {'✅' if OPENCV_AVAILABLE else '❌'}")
-    st.sidebar.write(f"PyTorch доступен: {'✅' if TORCH_AVAILABLE else '❌'}")
+    st.sidebar.write(f"SciPy доступен: {'✅' if SCIPY_AVAILABLE else '❌'}")
     
-    if not OPENCV_AVAILABLE:
-        st.warning("""
-        ⚠️ OpenCV не установлен. Некоторые функции будут ограничены.
+    if not OPENCV_AVAILABLE or not SCIPY_AVAILABLE:
+        st.info("""
+        ℹ️ **Для лучшей работы рекомендуется установить все зависимости:**
         
-        Попробуйте установить вручную:
-        ```
-        pip install opencv-python-headless
+        **В терминале:**
+        ```bash
+        pip install --user opencv-python-headless scipy numpy pillow
         ```
         
-        Или перезапустите приложение - оно попытается установить автоматически.
+        **Или перезапустите приложение для автоматической установки**
         """)
     
-    utils = WatermarkUtils()
+    processor = ImageProcessor()
     
     # Создание примера изображения
     if st.button("Создать пример изображения"):
-        sample_img = utils.make_sample_image()
-        st.image(sample_img, caption="Пример изображения с водяным знаком", use_column_width=True)
+        sample_img = processor.make_sample_image()
+        st.image(sample_img, caption="Пример изображения с водяным знаком", width=None)
         
-        # Сохранение для скачивания
-        img_bytes = utils.save_image(sample_img)
+        img_bytes = processor.save_image(sample_img)
         st.download_button(
             label="Скачать пример",
             data=img_bytes,
@@ -216,41 +214,41 @@ def main():
     
     if uploaded_file is not None:
         # Отображение оригинального изображения
-        original_image = utils.load_image(uploaded_file)
-        st.image(original_image, caption="Оригинальное изображение", use_column_width=True)
+        original_image = processor.load_image(uploaded_file)
+        st.image(original_image, caption="Оригинальное изображение", width=None)
         
         # Параметры обработки
         st.sidebar.header("Настройки обработки")
-        thresh = st.sidebar.slider("Порог бинаризации", 0, 255, 150)
-        invert = st.sidebar.checkbox("Инвертировать маску", False)
-        kernel_size = st.sidebar.slider("Размер ядра", 1, 15, 5)
+        threshold = st.sidebar.slider("Порог бинаризации", 0, 255, 150)
+        invert_mask = st.sidebar.checkbox("Инвертировать маску", False)
+        kernel_size = st.sidebar.slider("Размер ядра морфологии", 1, 15, 5)
         
-        # Конвертация в grayscale для создания маски
-        if OPENCV_AVAILABLE:
-            gray = cv2.cvtColor(original_image, cv2.COLOR_RGB2GRAY)
-        else:
-            # Альтернатива без OpenCV
-            gray = np.mean(original_image, axis=2).astype(np.uint8)
+        # Конвертация в grayscale
+        gray_image = processor.rgb_to_grayscale(original_image)
         
         # Создание маски
-        mask = utils.make_mask_from_gray(gray, thresh=thresh, invert=invert, k=kernel_size)
+        mask = processor.create_mask(gray_image, threshold, invert_mask)
+        
+        # Применение морфологических операций
+        if OPENCV_AVAILABLE and kernel_size > 1:
+            mask = processor.apply_morphology(mask, kernel_size)
         
         # Показ маски
-        st.image(mask, caption="Обнаруженная маска", use_column_width=True, clamp=True)
+        st.image(mask, caption="Обнаруженная маска", width=None, clamp=True)
         
         # Показ маски наложенной на изображение
-        masked_image = utils.overlay_mask_on_image(original_image, mask)
-        st.image(masked_image, caption="Маска на изображении", use_column_width=True)
+        masked_image = processor.overlay_mask(original_image, mask)
+        st.image(masked_image, caption="Маска на изображении", width=None)
         
         # Удаление водяного знака
         if st.button("Удалить водяной знак"):
             with st.spinner("Обработка..."):
-                result = utils.inpaint_bgr(original_image, mask)
+                result = processor.remove_watermark(original_image, mask)
             
-            st.image(result, caption="Результат удаления", use_column_width=True)
+            st.image(result, caption="Результат удаления", width=None)
             
             # Кнопка скачивания
-            result_bytes = utils.save_image(result)
+            result_bytes = processor.save_image(result)
             st.download_button(
                 label="Скачать результат",
                 data=result_bytes,
