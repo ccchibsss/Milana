@@ -2,25 +2,23 @@
 """
 watermark_tool.py
 
-Универсальный скрипт для удаления простых водяных знаков.
-- Если установлен streamlit, можно запустить веб-интерфейс:
-    python watermark_tool.py --serve
-  Скрипт сам попытается запустить `python -m streamlit run ... -- --streamlit-app`.
-- В противном случае работает как CLI:
-    python watermark_tool.py --input in.jpg --output out.png --method inpaint --thresh 150
-Примечания:
-- OpenCV (cv2) желателен для inpaint и морфологии маски, но не обязателен.
-- Pillow (PIL) желателен для чтения/записи; если его нет, сохраняется PPM.
+Исправленный и рабочий вариант:
+- Работает в CLI режиме по умолчанию.
+- При наличии streamlit можно запускать UI: python watermark_tool.py --serve
+  (скрипт попытается запустить `python -m streamlit run <thisfile> -- --streamlit-app`)
+- Если streamlit импортирован (например, когда streamlit запускает файл), скрипт
+  вызовет streamlit_app_entry() и отрисует интерфейс внутри Streamlit.
 """
 
 from __future__ import annotations
 import sys
 import os
+import io
 import argparse
 import subprocess
 from pathlib import Path
 
-# Опциональные зависимости
+# опциональные зависимости
 try:
     import numpy as np
 except Exception:
@@ -51,10 +49,8 @@ def make_sample_image() -> np.ndarray:
         cv2.putText(img, "SAMPLE IMAGE", (40, 180), cv2.FONT_HERSHEY_SIMPLEX, 2.0, (80, 80, 200), 4, cv2.LINE_AA)
         cv2.putText(img, "WATERMARK", (300, 320), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 200, 200), 2, cv2.LINE_AA)
     else:
-        # простая имитация текста: цветной прямоугольник как "водяной знак"
-        cv2_like = img
-        cv2_like[300:340, 260:560] = (200, 200, 200)
-        img = cv2_like
+        # простая имитация "водяного знака" прямоугольником
+        img[300:340, 260:560] = (200, 200, 200)
     return img
 
 def load_image(path: str) -> np.ndarray | None:
@@ -73,17 +69,11 @@ def load_image(path: str) -> np.ndarray | None:
         img = cv2.imread(str(p))
         return img
     else:
-        # Попытка простого чтения через numpy (только для PPM/PGM)
-        with open(p, "rb") as f:
-            header = f.read(2)
-            if header != b"P6":
-                print("Без PIL и без OpenCV, поддерживаются только PPM (P6).")
-                return None
-        print("PIL и OpenCV не установлены; чтение ограничено PPM.")
+        print("PIL и OpenCV отсутствуют; чтение поддерживается не полностью.")
         return None
 
 def save_image_bgr(img_bgr: np.ndarray, out_path: str) -> None:
-    """Сохранить BGR numpy в файл PNG (или PPM как запасной вариант)."""
+    """Сохранить BGR numpy в файл (PIL/ OpenCV / PPM fallback)."""
     p = Path(out_path)
     if HAS_PIL:
         pil = Image.fromarray(img_bgr[:, :, ::-1])  # BGR -> RGB
@@ -129,13 +119,11 @@ def inpaint_bgr(img_bgr: np.ndarray, mask: np.ndarray) -> np.ndarray:
 # -------------------- Streamlit-приложение (опционально) --------------------
 
 def streamlit_app_entry():
-    """Функция, выполняемая внутри Streamlit процесса. Импорт streamlit здесь локально."""
+    """Запуск UI внутри процесса Streamlit."""
     import streamlit as st
-    st.set_page_config(page_title="Image Watermark Remover", layout="wide")
-    st.title("Image Watermark Remover (streamlit)")
-
-    import numpy as np
-    from PIL import Image
+    import io as _io
+    import numpy as _np
+    from PIL import Image as _Image
     try:
         import cv2 as st_cv2
         st_has_cv2 = True
@@ -143,14 +131,22 @@ def streamlit_app_entry():
         st_cv2 = None
         st_has_cv2 = False
 
-    def to_pil(bgr: np.ndarray) -> Image.Image:
-        return Image.fromarray(bgr[:, :, ::-1])
+    st.set_page_config(page_title="Image Watermark Remover", layout="wide")
+    st.title("Image Watermark Remover (streamlit)")
 
-    uploaded = st.file_uploader("Upload image (PNG/JPG). If none uploaded, a sample will be used.", type=["png", "jpg", "jpeg"])
+    def to_pil(bgr: np.ndarray) -> _Image.Image:
+        return _Image.fromarray(bgr[:, :, ::-1])
+
+    uploaded = st.file_uploader("Upload image (PNG/JPG). If none uploaded, a sample will be used.",
+                               type=["png", "jpg", "jpeg"])
     if uploaded:
         data = uploaded.read()
-        pil = Image.open(io.BytesIO(data)).convert("RGB")
-        img_bgr = np.array(pil)[:, :, ::-1]
+        try:
+            pil = _Image.open(_io.BytesIO(data)).convert("RGB")
+            img_bgr = _np.array(pil)[:, :, ::-1]
+        except Exception:
+            st.error("Не удалось прочитать загруженный файл.")
+            st.stop()
     else:
         img_bgr = make_sample_image()
 
@@ -167,30 +163,36 @@ def streamlit_app_entry():
         st.image(to_pil(img_bgr), use_column_width=True)
 
     gray = (st_cv2.cvtColor(img_bgr, st_cv2.COLOR_BGR2GRAY) if st_has_cv2
-            else (np.dot(img_bgr[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)))
+            else (_np.dot(img_bgr[..., :3], [0.2989, 0.5870, 0.1140]).astype(_np.uint8)))
     mask_preview = make_mask_from_gray(gray, thresh, invert_mask, kernel_size)
 
     with col2:
         st.subheader("Mask preview")
-        st.image(Image.fromarray(mask_preview), use_column_width=True, caption="White = detected area")
+        st.image(_Image.fromarray(mask_preview), use_column_width=True, caption="White = detected area")
 
     if apply:
         if method.startswith("Binary"):
-            result = (cv2.cvtColor(mask_preview, cv2.COLOR_GRAY2BGR) if st_has_cv2 else np.stack([mask_preview]*3, axis=-1))
+            if st_has_cv2:
+                result = st_cv2.cvtColor(mask_preview, st_cv2.COLOR_GRAY2BGR)
+            else:
+                result = _np.stack([mask_preview] * 3, axis=-1)
         else:
             if st_has_cv2:
                 result = st_cv2.inpaint(img_bgr, mask_preview, 3, st_cv2.INPAINT_TELEA)
             else:
                 st.warning("OpenCV не доступен: покажем маску вместо inpaint.")
-                result = np.stack([mask_preview]*3, axis=-1)
+                result = _np.stack([mask_preview] * 3, axis=-1)
+
         st.subheader("Result")
         st.image(to_pil(result), use_column_width=True)
+
         # Скачивание
-        import io as _io
         buf = _io.BytesIO()
-        Image.fromarray(result[:, :, ::-1]).save(buf, format="PNG")
+        _Image.fromarray(result[:, :, ::-1]).save(buf, format="PNG")
         buf.seek(0)
         st.download_button("Download PNG", data=buf, file_name="result.png", mime="image/png")
+    else:
+        st.info("Adjust settings in the sidebar and click 'Apply removal' to process the image.")
 
 # -------------------- CLI и запуск --------------------
 
@@ -205,11 +207,12 @@ def run_cli(args):
             print("Не удалось загрузить изображение. Выход.")
             return 2
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if HAS_CV2 else (np.dot(img[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8))
+    gray = (cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if HAS_CV2
+            else (np.dot(img[..., :3], [0.2989, 0.5870, 0.1140]).astype(np.uint8)))
     mask = make_mask_from_gray(gray, thresh=args.thresh, invert=args.invert, k=args.kernel)
 
     if args.method == "threshold":
-        result = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if HAS_CV2 else np.stack([mask]*3, axis=-1)
+        result = (cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR) if HAS_CV2 else np.stack([mask] * 3, axis=-1))
     else:
         result = inpaint_bgr(img, mask)
 
@@ -219,8 +222,7 @@ def run_cli(args):
     return 0
 
 def try_launch_streamlit_here():
-    """Попытаться запустить streamlit как отдельный процесс, если модуль доступен."""
-    # определяем путь к этому файлу
+    """Попытаться запустить streamlit как отдельный процесс."""
     try:
         filepath = os.path.abspath(__file__)
     except NameError:
@@ -229,7 +231,8 @@ def try_launch_streamlit_here():
     print("Запуск Streamlit командой:")
     print(" ".join(cmd))
     try:
-        subprocess.run(cmd)
+        # Popen чтобы не блокировать текущий процесс
+        subprocess.Popen(cmd)
     except FileNotFoundError:
         print("streamlit не найден в окружении. Установите пакет: pip install streamlit")
     except Exception as e:
@@ -238,7 +241,7 @@ def try_launch_streamlit_here():
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Watermark remover (CLI or streamlit).")
     parser.add_argument("--serve", action="store_true", help="Попытаться запустить Streamlit UI (если доступен).")
-    parser.add_argument("--streamlit-app", action="store_true", help="Внутренний маркер: запустить streamlit-приложение (не указывать вручную).")
+    parser.add_argument("--streamlit-app", action="store_true", help="Внутренний маркер: запустить streamlit-приложение.")
     parser.add_argument("--input", "-i", help="Входной файл (PNG/JPG). Если не указан, используется пример.")
     parser.add_argument("--output", "-o", help="Выходной файл (PNG/PPM). По умолчанию result.png")
     parser.add_argument("--method", "-m", choices=("inpaint", "threshold"), default="inpaint", help="Метод: inpaint (с cv2) или threshold.")
@@ -247,29 +250,25 @@ def main(argv=None):
     parser.add_argument("--invert", action="store_true", help="Инвертировать маску.")
     args = parser.parse_args(argv)
 
-    # Если запускают внутренний streamlit маркер, импортируем и запускаем приложение здесь.
-    if args.streamlit_app:
-        # Это выполняется внутри процесса streamlit; streamlit уже доступен.
+    # Если скрипт запущен внутри Streamlit (модуль streamlit уже импортирован)
+    if "streamlit" in sys.modules or args.streamlit_app:
         try:
             streamlit_app_entry()
         except Exception as e:
             print("Ошибка в streamlit-приложении:", e)
-        return
+        return 0
 
     if args.serve:
-        # Попытаться найти streamlit и запустить его как отдельный процесс.
         try:
-            import streamlit  # availability check
-            # Запускаем как внешнюю команду, чтобы streamlit корректно поднял сервер
+            import streamlit  # проверка доступности
             try_launch_streamlit_here()
         except Exception:
             print("Streamlit не установлен или недоступен в текущем окружении.")
             print("Установите streamlit: pip install streamlit")
-        return
+        return 0
 
     # Иначе режим CLI
-    return_code = run_cli(args)
-    return return_code
+    return run_cli(args)
 
 if __name__ == "__main__":
     sys.exit(main())
