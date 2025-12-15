@@ -1,3 +1,4 @@
+import streamlit as st
 """
 WatermarkRemover-AI GUI - Ohio Edition
 PyWebview frontend with brainrot HTML UI
